@@ -1,43 +1,54 @@
 const express = require("express");
 const router = express.Router();
-const db = require("../database");
+const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 
-router.post("/", authMiddleware, (req, res) => {
+router.post("/", authMiddleware, async (req, res) => {
   const { koibito_id, memory_text } = req.body;
   const userId = req.user.id;
 
-  db.run(
-    "INSERT INTO memories (koibito_id, user_id, memory_text) VALUES (?, ?, ?)",
-    [koibito_id, userId, memory_text],
-    function (err) {
-      if (err) {
-        return res.status(500).json({ message: "Failed to save memory" });
-      }
+  if (!koibito_id || !memory_text) {
+    return res.status(400).json({
+      message: "koibito_id and memory_text are required",
+    });
+  }
 
-      res.json({
-        message: "Memory saved",
-        memory_id: this.lastID
-      });
-    }
-  );
+  try {
+    const result = await pool.query(
+      `INSERT INTO memories (koibito_id, user_id, memory_text)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [koibito_id, userId, memory_text]
+    );
+
+    res.json({
+      message: "Memory saved",
+      memory_id: result.rows[0].id,
+    });
+  } catch (error) {
+    console.error("Save memory error:", error);
+    res.status(500).json({ message: "Failed to save memory" });
+  }
 });
 
-router.get("/:koibito_id", authMiddleware, (req, res) => {
+router.get("/:koibito_id", authMiddleware, async (req, res) => {
   const koibitoId = req.params.koibito_id;
   const userId = req.user.id;
 
-  db.all(
-    "SELECT * FROM memories WHERE koibito_id = ? AND user_id = ? ORDER BY created_at DESC",
-    [koibitoId, userId],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ message: "Failed to fetch memories" });
-      }
+  try {
+    const result = await pool.query(
+      `SELECT *
+       FROM memories
+       WHERE koibito_id = $1 AND user_id = $2
+       ORDER BY created_at DESC`,
+      [koibitoId, userId]
+    );
 
-      res.json({ memories: rows });
-    }
-  );
+    res.json({ memories: result.rows });
+  } catch (error) {
+    console.error("Fetch memories error:", error);
+    res.status(500).json({ message: "Failed to fetch memories" });
+  }
 });
 
 module.exports = router;
