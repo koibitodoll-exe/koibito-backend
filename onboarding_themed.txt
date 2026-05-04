@@ -1,0 +1,1294 @@
+import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { router } from 'expo-router';
+import React, { useEffect, useMemo, useState } from 'react';
+import { useTheme } from '@/theme/ThemeContext';
+import { getOnboardingTheme } from '@/theme/screens/onboardingTheme';
+import {
+  ActivityIndicator,
+  Alert,
+  KeyboardAvoidingView,
+  Linking,
+  PermissionsAndroid,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import WifiManager from 'react-native-wifi-reborn';
+import { API_BASE_URL } from '../../config/api';
+
+type WifiNetwork = {
+  id: string;
+  ssid: string;
+  signal: number;
+  secured: boolean;
+};
+
+type DiscoveredDevice = {
+  id: string;
+  name: string;
+  signal: number;
+  claimed?: boolean;
+  pairing_mode?: boolean;
+};
+
+export function OnboardingContent() {
+  const { theme } = useTheme();
+  const ui = getOnboardingTheme((theme as any)?.name || 'default');
+  const styles = useMemo(() => createStyles(ui), [ui]);
+
+  const [currentStep, setCurrentStep] = useState(1);
+  const [availableNetworks, setAvailableNetworks] = useState<WifiNetwork[]>([]);
+  const [isLoadingWifi, setIsLoadingWifi] = useState(false);
+  const [wifiError, setWifiError] = useState<string | null>(null);
+
+  const [selectedNetwork, setSelectedNetwork] = useState<WifiNetwork | null>(null);
+  const [wifiPassword, setWifiPassword] = useState('');
+  const [showWifiPassword, setShowWifiPassword] = useState(false);
+  const [isManualEntry, setIsManualEntry] = useState(false);
+  const [manualSSID, setManualSSID] = useState('');
+  const [manualPassword, setManualPassword] = useState('');
+  const [isSavingWifi, setIsSavingWifi] = useState(false);
+
+  const [apiKey, setApiKey] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [isSavingApiKey, setIsSavingApiKey] = useState(false);
+
+  const [isSearching, setIsSearching] = useState(false);
+  const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveredDevice[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<DiscoveredDevice | null>(null);
+  const [pairedDeviceId, setPairedDeviceId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (currentStep === 1 && !isManualEntry) {
+      void loadWifiNetworks();
+    }
+  }, [currentStep, isManualEntry]);
+
+  const requestWifiPermissions = async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') {
+      setWifiError('Nearby WiFi scanning is only available on Android.');
+      return false;
+    }
+
+    try {
+      const permissions = [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+
+      if (Platform.Version >= 33) {
+        permissions.push(PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES);
+      }
+
+      const result = await PermissionsAndroid.requestMultiple(permissions as any);
+
+      const allGranted = permissions.every(
+        (permission) => result[permission] === PermissionsAndroid.RESULTS.GRANTED
+      );
+
+      if (!allGranted) {
+        setWifiError('WiFi scan permission was denied.');
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.log('WiFi permission error:', error);
+      setWifiError('Could not request WiFi permissions.');
+      return false;
+    }
+  };
+
+  const mapSignalLevelToPercent = (level: number) => {
+    if (level >= -50) return 95;
+    if (level >= -60) return 80;
+    if (level >= -70) return 65;
+    if (level >= -80) return 45;
+    return 25;
+  };
+
+  const loadWifiNetworks = async () => {
+    if (Platform.OS !== 'android') {
+      setWifiError('Nearby WiFi scanning is only supported on Android.');
+      setAvailableNetworks([]);
+      return;
+    }
+
+    try {
+      setIsLoadingWifi(true);
+      setWifiError(null);
+
+      const granted = await requestWifiPermissions();
+      if (!granted) {
+        setAvailableNetworks([]);
+        return;
+      }
+
+      const rawList = await WifiManager.reScanAndLoadWifiList();
+
+      const networks: WifiNetwork[] = (rawList || [])
+        .filter((item: any) => item?.SSID && item.SSID.trim().length > 0)
+        .map((item: any, index: number) => ({
+          id: item.BSSID || `${item.SSID}-${index}`,
+          ssid: item.SSID,
+          signal: mapSignalLevelToPercent(Number(item.level ?? -100)),
+          secured: !!item.capabilities && item.capabilities !== '[ESS]',
+        }))
+        .sort((a, b) => b.signal - a.signal);
+
+      const deduped = networks.filter(
+        (network, index, self) =>
+          index === self.findIndex((n) => n.ssid === network.ssid)
+      );
+
+      setAvailableNetworks(deduped);
+
+      if (deduped.length === 0) {
+        setWifiError('No nearby WiFi networks found. Make sure location is ON.');
+      }
+    } catch (error: any) {
+      console.log('WiFi scan failed:', error);
+      setAvailableNetworks([]);
+      setWifiError(
+        error?.message ||
+          'WiFi scan failed. Check permissions and make sure location is enabled.'
+      );
+    } finally {
+      setIsLoadingWifi(false);
+    }
+  };
+
+  const handleWifiContinue = async () => {
+    const wifiCredentials = isManualEntry
+      ? { ssid: manualSSID.trim(), password: manualPassword }
+      : { ssid: selectedNetwork?.ssid || '', password: wifiPassword };
+
+    if (!wifiCredentials.ssid) {
+      Alert.alert('Missing WiFi', 'Choose a network or enter one manually.');
+      return;
+    }
+
+    if (!wifiCredentials.password) {
+      Alert.alert('Missing password', 'Enter the WiFi password first.');
+      return;
+    }
+
+    try {
+      setIsSavingWifi(true);
+
+      const token = await AsyncStorage.getItem('auth_token');
+
+      if (!token) {
+        Alert.alert('Not signed in', 'Please log in again.');
+        return;
+      }
+
+      const response = await fetch(`${API_BASE_URL}/connections/wifi`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          ssid: wifiCredentials.ssid,
+          password: wifiCredentials.password,
+          is_preferred: true,
+          queue_connect: false,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data?.message || 'Failed to save WiFi');
+      }
+
+      await AsyncStorage.setItem('koibito_wifi_ssid', wifiCredentials.ssid);
+      await AsyncStorage.setItem('koibito_wifi_password', wifiCredentials.password);
+
+      setCurrentStep(2);
+    } catch (error: any) {
+      Alert.alert('WiFi save failed', error.message || 'Could not save WiFi settings.');
+    } finally {
+      setIsSavingWifi(false);
+    }
+  };
+
+  const handleApiKeyContinue = async () => {
+    if (!apiKey.trim()) {
+      Alert.alert('Missing API key', 'Paste your API key first.');
+      return;
+    }
+
+    try {
+      setIsSavingApiKey(true);
+
+      const token = await AsyncStorage.getItem('auth_token');
+
+      if (!token) {
+        Alert.alert('Not signed in', 'Please log in again.');
+        return;
+      }
+
+      const cleanKey = apiKey.trim();
+
+      const response = await fetch(`${API_BASE_URL}/connections/api-key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          provider: 'openai',
+          api_key_encrypted: cleanKey,
+          last4: cleanKey.slice(-4),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data?.message || 'Failed to save API key');
+      }
+
+      await AsyncStorage.setItem('koibito_api_key', cleanKey);
+
+      setCurrentStep(3);
+    } catch (error: any) {
+      Alert.alert('API key save failed', error.message || 'Could not save API key.');
+    } finally {
+      setIsSavingApiKey(false);
+    }
+  };
+
+  const handleFindKoibito = async () => {
+    try {
+      setIsSearching(true);
+      setDiscoveredDevices([]);
+      setSelectedDevice(null);
+
+      const token = await AsyncStorage.getItem('auth_token');
+
+      if (!token) {
+        Alert.alert('Not signed in', 'Please log in again.');
+        return;
+      }
+
+      const startRes = await fetch(`${API_BASE_URL}/pairing/start`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({}),
+      });
+
+      const startData = await startRes.json();
+
+      if (!startRes.ok) {
+        throw new Error(startData?.message || 'Failed to start pairing session');
+      }
+
+      const sessionId = startData?.session_id;
+      if (!sessionId) {
+        throw new Error('Missing pairing session id');
+      }
+
+      const devicesRes = await fetch(`${API_BASE_URL}/pairing/${sessionId}/devices`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      const devicesData = await devicesRes.json();
+
+      if (!devicesRes.ok) {
+        throw new Error(devicesData?.message || 'Failed to fetch devices');
+      }
+
+      const devices: DiscoveredDevice[] = (devicesData?.devices || []).map(
+        (device: any, index: number) => ({
+          id: device.device_id,
+          name:
+            typeof device.name === 'string' && device.name.trim().length > 0
+              ? device.name
+              : `Koibito ${index + 1}`,
+          signal: 85,
+          claimed: !!device.claimed,
+          pairing_mode: !!device.pairing_mode,
+        })
+      );
+
+      await AsyncStorage.setItem('pairing_session_id', String(sessionId));
+      setDiscoveredDevices(devices);
+
+      if (devices.length === 0) {
+        Alert.alert('No Koibito found', 'No available Koibito devices are nearby right now.');
+      }
+    } catch (error: any) {
+      Alert.alert('Pairing failed', error?.message || 'Could not find Koibito devices.');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const handlePairDevice = async (device: DiscoveredDevice) => {
+    try {
+      setSelectedDevice(device);
+
+      const token = await AsyncStorage.getItem('auth_token');
+      const sessionId = await AsyncStorage.getItem('pairing_session_id');
+
+      if (!token) {
+        Alert.alert('Not signed in', 'Please log in again.');
+        return;
+      }
+
+      if (!sessionId) {
+        Alert.alert('Missing session', 'Please search for your Koibito again.');
+        return;
+      }
+
+      const response = await fetch(`${API_BASE_URL}/pairing/${sessionId}/claim`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          device_id: device.id,
+          app_device_id: 'app-test-001',
+          app_name: 'Liv Phone',
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data?.message || 'Failed to claim device');
+      }
+
+      setPairedDeviceId(device.id);
+
+      const newDevice = {
+        id: device.id,
+        name: device.name,
+        pairedAt: new Date().toISOString(),
+        isConnected: true,
+      };
+
+      await AsyncStorage.setItem('koibito_paired_device', JSON.stringify(newDevice));
+      await AsyncStorage.setItem('koibito_setup_complete', 'true');
+      await AsyncStorage.removeItem('pairing_session_id');
+
+      setTimeout(() => {
+        router.replace('/(tabs)' as any);
+      }, 1500);
+    } catch (error: any) {
+      Alert.alert('Pairing failed', error?.message || 'Could not pair device.');
+    }
+  };
+
+  const handleSkip = async () => {
+    await AsyncStorage.multiSet([
+      ['setupSkipped', 'true'],
+      ['koibito_setup_skipped', 'true'],
+      ['koibito_setup_complete', 'skipped'],
+    ]);
+
+    router.replace('/(tabs)' as any);
+  };
+
+  const getSignalBars = (signal: number) => {
+    if (signal >= 80) return 4;
+    if (signal >= 60) return 3;
+    if (signal >= 40) return 2;
+    return 1;
+  };
+
+  const canContinueWifi = useMemo(() => {
+    if (isManualEntry) return !!manualSSID && !!manualPassword;
+    if (!selectedNetwork) return false;
+    if (!selectedNetwork.secured) return true;
+    return !!wifiPassword;
+  }, [isManualEntry, manualSSID, manualPassword, selectedNetwork, wifiPassword]);
+
+  return (
+    <KeyboardAvoidingView
+      style={styles.screen}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
+      <ScrollView
+        style={styles.screen}
+        contentContainerStyle={styles.container}
+        showsVerticalScrollIndicator={false}
+        bounces={false}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={styles.bgGradient} />
+        <View style={styles.orbTopLeft} />
+        <View style={styles.orbBottomRight} />
+
+        <View style={styles.content}>
+          <View style={styles.header}>
+            <Text style={styles.title}>Welcome to Koibito</Text>
+            <Text style={styles.subtitle}>Let&apos;s get you set up in just a few steps</Text>
+          </View>
+
+          <View style={styles.stepsRow}>
+            {[1, 2, 3].map((step) => (
+              <React.Fragment key={step}>
+                <View
+                  style={[
+                    styles.stepCircle,
+                    currentStep === step && styles.stepCircleActive,
+                    currentStep > step && styles.stepCircleDone,
+                  ]}
+                >
+                  {currentStep > step ? (
+                    <Ionicons name="checkmark" size={18} color={ui.white} />
+                  ) : (
+                    <Text
+                      style={[
+                        styles.stepCircleText,
+                        currentStep === step && styles.stepCircleTextActive,
+                      ]}
+                    >
+                      {step}
+                    </Text>
+                  )}
+                </View>
+
+                {step < 3 && (
+                  <View
+                    style={[
+                      styles.stepLine,
+                      currentStep > step && styles.stepLineActive,
+                    ]}
+                  />
+                )}
+              </React.Fragment>
+            ))}
+          </View>
+
+          <View style={styles.card}>
+            {currentStep === 1 && (
+              <View style={styles.section}>
+                <View style={styles.sectionHeader}>
+                  <View style={styles.sectionIconWrap}>
+                    <Ionicons name="wifi-outline" size={24} color={ui.primary} />
+                  </View>
+                  <View>
+                    <Text style={styles.sectionTitle}>Connect to WiFi</Text>
+                    <Text style={styles.sectionSub}>Choose a network or add manually</Text>
+                  </View>
+                </View>
+
+                {!isManualEntry ? (
+                  <>
+                    <View style={styles.rowButtons}>
+                      <Text style={[styles.label, { flex: 1, marginBottom: 0 }]}>
+                        Available Networks
+                      </Text>
+
+                      <Pressable onPress={loadWifiNetworks} style={styles.secondaryButton}>
+                        {isLoadingWifi ? (
+                          <ActivityIndicator color={ui.text} />
+                        ) : (
+                          <Text style={styles.secondaryButtonText}>Refresh</Text>
+                        )}
+                      </Pressable>
+                    </View>
+
+                    {wifiError ? <Text style={styles.helperText}>{wifiError}</Text> : null}
+
+                    {isLoadingWifi ? (
+                      <View style={styles.searchingCard}>
+                        <ActivityIndicator size="large" color={ui.primary} />
+                        <Text style={styles.searchingText}>Scanning nearby WiFi networks...</Text>
+                      </View>
+                    ) : (
+                      <View style={styles.listWrap}>
+                        {availableNetworks.map((network) => (
+                          <Pressable
+                            key={network.id}
+                            onPress={() => setSelectedNetwork(network)}
+                            style={[
+                              styles.networkCard,
+                              selectedNetwork?.id === network.id && styles.networkCardActive,
+                            ]}
+                          >
+                            <View style={styles.networkLeft}>
+                              <Ionicons name="wifi-outline" size={18} color={ui.primary} />
+                              <View>
+                                <Text style={styles.networkName}>{network.ssid}</Text>
+
+                                {network.secured && (
+                                  <View style={styles.securedRow}>
+                                    <Ionicons
+                                      name="lock-closed-outline"
+                                      size={12}
+                                      color={ui.muted}
+                                    />
+                                    <Text style={styles.securedText}>Secured</Text>
+                                  </View>
+                                )}
+                              </View>
+                            </View>
+
+                            <SignalBars bars={getSignalBars(network.signal)} />
+                          </Pressable>
+                        ))}
+                      </View>
+                    )}
+
+                    {selectedNetwork?.secured && (
+                      <View>
+                        <Text style={styles.label}>Password</Text>
+
+                        <View style={styles.inputWrap}>
+                          <Ionicons name="lock-closed-outline" size={18} color={ui.muted} />
+                          <TextInput
+                            value={wifiPassword}
+                            onChangeText={setWifiPassword}
+                            placeholder="Enter WiFi password"
+                            placeholderTextColor={ui.muted}
+                            secureTextEntry={!showWifiPassword}
+                            style={styles.input}
+                          />
+
+                          <Pressable onPress={() => setShowWifiPassword(!showWifiPassword)}>
+                            <Ionicons
+                              name={showWifiPassword ? 'eye-off-outline' : 'eye-outline'}
+                              size={18}
+                              color={ui.muted}
+                            />
+                          </Pressable>
+                        </View>
+                      </View>
+                    )}
+
+                    <Pressable onPress={() => setIsManualEntry(true)} style={styles.manualButton}>
+                      <Ionicons name="add-outline" size={18} color={ui.muted} />
+                      <Text style={styles.manualButtonText}>Add network manually</Text>
+                    </Pressable>
+                  </>
+                ) : (
+                  <>
+                    <View style={styles.fieldWrap}>
+                      <Text style={styles.label}>Network Name (SSID)</Text>
+
+                      <View style={styles.inputWrap}>
+                        <Ionicons name="wifi-outline" size={18} color={ui.muted} />
+                        <TextInput
+                          value={manualSSID}
+                          onChangeText={setManualSSID}
+                          placeholder="Enter network name"
+                          placeholderTextColor={ui.muted}
+                          style={styles.input}
+                        />
+                      </View>
+                    </View>
+
+                    <View style={styles.fieldWrap}>
+                      <Text style={styles.label}>Password</Text>
+
+                      <View style={styles.inputWrap}>
+                        <Ionicons name="lock-closed-outline" size={18} color={ui.muted} />
+                        <TextInput
+                          value={manualPassword}
+                          onChangeText={setManualPassword}
+                          placeholder="Enter password"
+                          placeholderTextColor={ui.muted}
+                          secureTextEntry={!showWifiPassword}
+                          style={styles.input}
+                        />
+
+                        <Pressable onPress={() => setShowWifiPassword(!showWifiPassword)}>
+                          <Ionicons
+                            name={showWifiPassword ? 'eye-off-outline' : 'eye-outline'}
+                            size={18}
+                            color={ui.muted}
+                          />
+                        </Pressable>
+                      </View>
+                    </View>
+
+                    <Pressable
+                      onPress={() => {
+                        setIsManualEntry(false);
+                        setManualSSID('');
+                        setManualPassword('');
+                      }}
+                    >
+                      <Text style={styles.backInline}>← Back to available networks</Text>
+                    </Pressable>
+                  </>
+                )}
+
+                <Pressable
+                  onPress={handleWifiContinue}
+                  disabled={!canContinueWifi || isSavingWifi}
+                  style={[
+                    styles.primaryButton,
+                    (!canContinueWifi || isSavingWifi) && styles.disabledButton,
+                  ]}
+                >
+                  {isSavingWifi ? (
+                    <ActivityIndicator color={ui.white} />
+                  ) : (
+                    <>
+                      <Text style={styles.primaryButtonText}>Continue</Text>
+                      <Ionicons name="chevron-forward" size={18} color={ui.white} />
+                    </>
+                  )}
+                </Pressable>
+              </View>
+            )}
+
+            {currentStep === 2 && (
+              <View style={styles.section}>
+                <View style={styles.sectionHeader}>
+                  <View style={styles.sectionIconWrapSecondary}>
+                    <Ionicons name="key-outline" size={24} color={ui.secondary || ui.primary} />
+                  </View>
+                  <View>
+                    <Text style={styles.sectionTitle}>API Key Setup</Text>
+                    <Text style={styles.sectionSub}>Connect Koibito to OpenAI</Text>
+                  </View>
+                </View>
+
+                <View style={styles.infoCard}>
+                  <Text style={styles.infoText}>
+                    Koibito needs an API key to work. This key will be stored securely
+                    on your device and only used to power Koibito&apos;s features.
+                  </Text>
+
+                  <View style={styles.infoActions}>
+                    <Pressable
+                      onPress={() => Linking.openURL('https://platform.openai.com/api-keys')}
+                      style={styles.infoPrimaryLink}
+                    >
+                      <Text style={styles.infoPrimaryLinkText}>Get your API key</Text>
+                      <Ionicons name="open-outline" size={14} color={ui.white} />
+                    </Pressable>
+
+                    <Pressable
+                      onPress={() => Linking.openURL('https://platform.openai.com/docs/quickstart')}
+                    >
+                      <Text style={styles.infoSecondaryLink}>How to create your own API key</Text>
+                    </Pressable>
+                  </View>
+                </View>
+
+                <View style={styles.fieldWrap}>
+                  <Text style={styles.label}>OpenAI API Key</Text>
+
+                  <View style={styles.inputWrap}>
+                    <Ionicons name="key-outline" size={18} color={ui.muted} />
+                    <TextInput
+                      value={apiKey}
+                      onChangeText={setApiKey}
+                      placeholder="Paste your API key here"
+                      placeholderTextColor={ui.muted}
+                      secureTextEntry={!showApiKey}
+                      autoCapitalize="none"
+                      style={styles.input}
+                    />
+
+                    <Pressable onPress={() => setShowApiKey(!showApiKey)}>
+                      <Ionicons
+                        name={showApiKey ? 'eye-off-outline' : 'eye-outline'}
+                        size={18}
+                        color={ui.muted}
+                      />
+                    </Pressable>
+                  </View>
+
+                  <Text style={styles.helperText}>
+                    Your API key will be stored securely and never shared
+                  </Text>
+                </View>
+
+                <View style={styles.rowButtons}>
+                  <Pressable onPress={() => setCurrentStep(1)} style={styles.secondaryButton}>
+                    <Text style={styles.secondaryButtonText}>Back</Text>
+                  </Pressable>
+
+                  <Pressable
+                    onPress={handleApiKeyContinue}
+                    disabled={!apiKey.trim() || isSavingApiKey}
+                    style={[
+                      styles.primaryButtonFlex,
+                      (!apiKey.trim() || isSavingApiKey) && styles.disabledButton,
+                    ]}
+                  >
+                    {isSavingApiKey ? (
+                      <ActivityIndicator color={ui.white} />
+                    ) : (
+                      <>
+                        <Text style={styles.primaryButtonText}>Continue</Text>
+                        <Ionicons name="chevron-forward" size={18} color={ui.white} />
+                      </>
+                    )}
+                  </Pressable>
+                </View>
+              </View>
+            )}
+
+            {currentStep === 3 && (
+              <View style={styles.section}>
+                <View style={styles.sectionHeader}>
+                  <View style={styles.sectionIconWrapAccent}>
+                    <Ionicons name="bluetooth-outline" size={24} color={ui.accent || ui.primary} />
+                  </View>
+                  <View>
+                    <Text style={styles.sectionTitle}>Device Pairing</Text>
+                    <Text style={styles.sectionSub}>Pair your Koibito to Koibito App</Text>
+                  </View>
+                </View>
+
+                <View style={styles.infoCardAccent}>
+                  <Text style={styles.infoText}>
+                    Make sure your Koibito device is powered on and ready to pair.
+                    Then press the button below to start the Bluetooth pairing process.
+                  </Text>
+                </View>
+
+                {!pairedDeviceId ? (
+                  <>
+                    <Pressable
+                      onPress={handleFindKoibito}
+                      disabled={isSearching}
+                      style={styles.primaryButton}
+                    >
+                      {isSearching ? (
+                        <>
+                          <ActivityIndicator color={ui.white} />
+                          <Text style={styles.primaryButtonText}>Searching...</Text>
+                        </>
+                      ) : (
+                        <>
+                          <Ionicons name="bluetooth-outline" size={18} color={ui.white} />
+                          <Text style={styles.primaryButtonText}>Find My Koibito</Text>
+                        </>
+                      )}
+                    </Pressable>
+
+                    {isSearching && (
+                      <View style={styles.searchingCard}>
+                        <ActivityIndicator size="large" color={ui.primary} />
+                        <Text style={styles.searchingText}>Searching for Koibito devices...</Text>
+                      </View>
+                    )}
+
+                    {!isSearching && discoveredDevices.length > 0 && (
+                      <View>
+                        <Text style={styles.label}>Available Devices</Text>
+
+                        <View style={styles.listWrap}>
+                          {discoveredDevices.map((device) => (
+                            <Pressable
+                              key={device.id}
+                              onPress={() => handlePairDevice(device)}
+                              style={styles.deviceCard}
+                            >
+                              <View style={styles.networkLeft}>
+                                <View style={styles.deviceIconWrap}>
+                                  <Ionicons
+                                    name="bluetooth-outline"
+                                    size={18}
+                                    color={ui.accent || ui.primary}
+                                  />
+                                </View>
+
+                                <View>
+                                  <Text style={styles.networkName}>{device.name}</Text>
+                                  <Text style={styles.deviceId}>{device.id}</Text>
+                                </View>
+                              </View>
+
+                              <View style={styles.deviceRight}>
+                                <SignalBars bars={getSignalBars(device.signal)} />
+                                <Ionicons name="chevron-forward" size={18} color={ui.muted} />
+                              </View>
+                            </Pressable>
+                          ))}
+                        </View>
+
+                        <Text style={styles.helperCenter}>Tap a device to pair</Text>
+                      </View>
+                    )}
+                  </>
+                ) : (
+                  <View style={styles.successWrap}>
+                    <View style={styles.successIcon}>
+                      <Ionicons name="checkmark" size={28} color={ui.success || '#16A34A'} />
+                    </View>
+
+                    <Text style={styles.successTitle}>Device Paired Successfully!</Text>
+                    <Text style={styles.successSub}>{selectedDevice?.name}</Text>
+                    <Text style={styles.successId}>ID: {pairedDeviceId}</Text>
+                    <Text style={styles.helperCenter}>Redirecting to home...</Text>
+                  </View>
+                )}
+              </View>
+            )}
+          </View>
+
+          <Pressable onPress={handleSkip} style={styles.skipWrap}>
+            <Text style={styles.skipText}>Skip for now →</Text>
+          </Pressable>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+}
+
+function SignalBars({ bars }: { bars: number }) {
+  const { theme } = useTheme();
+  const ui = getOnboardingTheme((theme as any)?.name || 'default');
+
+  return (
+    <View style={styles.signalBars}>
+      {[1, 2, 3, 4].map((bar) => (
+        <View
+          key={bar}
+          style={[
+            styles.signalBar,
+            { height: 4 + bar * 3 },
+            {
+              backgroundColor:
+                bar <= bars ? ui.success || '#22C55E' : ui.inactiveBar || '#D1D5DB',
+            },
+          ]}
+        />
+      ))}
+    </View>
+  );
+}
+
+const createStyles = (ui: ReturnType<typeof getOnboardingTheme>) =>
+  StyleSheet.create({
+    screen: {
+      flex: 1,
+      backgroundColor: ui.bg || '#F3EDF8',
+    },
+    container: {
+      flexGrow: 1,
+      justifyContent: 'center',
+      padding: 16,
+      backgroundColor: ui.bg || '#F3EDF8',
+    },
+    bgGradient: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: ui.bg || '#F3EDF8',
+    },
+    orbTopLeft: {
+      position: 'absolute',
+      top: 80,
+      left: 10,
+      width: 220,
+      height: 220,
+      borderRadius: 999,
+      backgroundColor: ui.soft1,
+    },
+    orbBottomRight: {
+      position: 'absolute',
+      bottom: 40,
+      right: 0,
+      width: 280,
+      height: 280,
+      borderRadius: 999,
+      backgroundColor: ui.soft2,
+    },
+    content: {
+      width: '100%',
+      maxWidth: 700,
+      alignSelf: 'center',
+      zIndex: 1,
+    },
+    header: {
+      alignItems: 'center',
+      marginBottom: 22,
+    },
+    title: {
+      fontSize: 34,
+      fontWeight: '800',
+      color: ui.primary,
+      textAlign: 'center',
+      marginBottom: 6,
+    },
+    subtitle: {
+      fontSize: 14,
+      color: ui.muted,
+      textAlign: 'center',
+    },
+    stepsRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginBottom: 22,
+    },
+    stepCircle: {
+      width: 40,
+      height: 40,
+      borderRadius: 999,
+      backgroundColor: ui.stepInactive,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    stepCircleActive: {
+      backgroundColor: ui.primary,
+      transform: [{ scale: 1.08 }],
+    },
+    stepCircleDone: {
+      backgroundColor: ui.primary,
+    },
+    stepCircleText: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: ui.text,
+    },
+    stepCircleTextActive: {
+      color: ui.white,
+    },
+    stepLine: {
+      width: 46,
+      height: 4,
+      borderRadius: 999,
+      backgroundColor: ui.stepInactive,
+      marginHorizontal: 8,
+    },
+    stepLineActive: {
+      backgroundColor: ui.primary,
+    },
+    card: {
+      backgroundColor: ui.card,
+      borderRadius: 28,
+      padding: 22,
+      borderWidth: 1,
+      borderColor: ui.border,
+    },
+    section: {
+      gap: 16,
+    },
+    sectionHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+      marginBottom: 4,
+    },
+    sectionIconWrap: {
+      width: 48,
+      height: 48,
+      borderRadius: 16,
+      backgroundColor: ui.soft1,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    sectionIconWrapSecondary: {
+      width: 48,
+      height: 48,
+      borderRadius: 16,
+      backgroundColor: ui.soft1,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    sectionIconWrapAccent: {
+      width: 48,
+      height: 48,
+      borderRadius: 16,
+      backgroundColor: ui.cardAccentBorder,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    sectionTitle: {
+      fontSize: 24,
+      fontWeight: '700',
+      color: ui.text,
+    },
+    sectionSub: {
+      fontSize: 12,
+      color: ui.muted,
+      marginTop: 2,
+    },
+    label: {
+      fontSize: 13,
+      color: ui.text,
+      fontWeight: '600',
+      marginBottom: 8,
+    },
+    listWrap: {
+      gap: 10,
+    },
+    networkCard: {
+      borderRadius: 16,
+      borderWidth: 1.5,
+      borderColor: ui.border,
+      backgroundColor: ui.white,
+      padding: 14,
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    networkCardActive: {
+      borderColor: ui.primary,
+      backgroundColor: ui.cardSoft,
+    },
+    networkLeft: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      flex: 1,
+    },
+    networkName: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: ui.text,
+    },
+    securedRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      marginTop: 2,
+    },
+    securedText: {
+      fontSize: 11,
+      color: ui.muted,
+    },
+    inputWrap: {
+      minHeight: 52,
+      borderRadius: 16,
+      backgroundColor: ui.white,
+      borderWidth: 1,
+      borderColor: ui.border,
+      paddingHorizontal: 14,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    input: {
+      flex: 1,
+      fontSize: 14,
+      color: ui.text,
+    },
+    manualButton: {
+      minHeight: 48,
+      borderRadius: 16,
+      borderWidth: 1.5,
+      borderStyle: 'dashed',
+      borderColor: ui.stepInactive,
+      backgroundColor: ui.white,
+      justifyContent: 'center',
+      alignItems: 'center',
+      flexDirection: 'row',
+      gap: 8,
+    },
+    manualButtonText: {
+      fontSize: 13,
+      color: ui.muted,
+      fontWeight: '600',
+    },
+    backInline: {
+      fontSize: 13,
+      color: ui.primary,
+      fontWeight: '600',
+    },
+    primaryButton: {
+      minHeight: 50,
+      borderRadius: 16,
+      backgroundColor: ui.primary,
+      justifyContent: 'center',
+      alignItems: 'center',
+      flexDirection: 'row',
+      gap: 8,
+      marginTop: 4,
+    },
+    primaryButtonFlex: {
+      flex: 1,
+      minHeight: 50,
+      borderRadius: 16,
+      backgroundColor: ui.primary,
+      justifyContent: 'center',
+      alignItems: 'center',
+      flexDirection: 'row',
+      gap: 8,
+    },
+    primaryButtonText: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: ui.white,
+    },
+    disabledButton: {
+      opacity: 0.5,
+    },
+    fieldWrap: {
+      gap: 8,
+    },
+    infoCard: {
+      borderRadius: 18,
+      padding: 14,
+      backgroundColor: ui.cardSoft,
+      borderWidth: 1,
+      borderColor: ui.soft1,
+    },
+    infoCardAccent: {
+      borderRadius: 18,
+      padding: 14,
+      backgroundColor: ui.cardAccent,
+      borderWidth: 1,
+      borderColor: ui.cardAccentBorder,
+    },
+    infoText: {
+      fontSize: 13,
+      lineHeight: 20,
+      color: ui.text,
+    },
+    infoActions: {
+      marginTop: 12,
+      gap: 10,
+    },
+    infoPrimaryLink: {
+      minHeight: 42,
+      borderRadius: 14,
+      backgroundColor: ui.primary,
+      justifyContent: 'center',
+      alignItems: 'center',
+      flexDirection: 'row',
+      gap: 6,
+    },
+    infoPrimaryLinkText: {
+      color: ui.white,
+      fontSize: 13,
+      fontWeight: '700',
+    },
+    infoSecondaryLink: {
+      fontSize: 13,
+      color: ui.primary,
+      fontWeight: '600',
+      textAlign: 'center',
+    },
+    helperText: {
+      fontSize: 11,
+      color: ui.muted,
+      marginTop: 6,
+    },
+    rowButtons: {
+      flexDirection: 'row',
+      gap: 10,
+    },
+    secondaryButton: {
+      minWidth: 90,
+      minHeight: 50,
+      borderRadius: 16,
+      borderWidth: 1,
+      borderColor: ui.border,
+      backgroundColor: ui.white,
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingHorizontal: 18,
+    },
+    secondaryButtonText: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: ui.text,
+    },
+    searchingCard: {
+      borderRadius: 18,
+      padding: 22,
+      backgroundColor: ui.cardSoft,
+      alignItems: 'center',
+      gap: 12,
+    },
+    searchingText: {
+      fontSize: 13,
+      color: ui.text,
+    },
+    deviceCard: {
+      borderRadius: 16,
+      borderWidth: 1.5,
+      borderColor: ui.border,
+      backgroundColor: ui.white,
+      padding: 14,
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    deviceIconWrap: {
+      width: 40,
+      height: 40,
+      borderRadius: 12,
+      backgroundColor: ui.cardAccent,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    deviceId: {
+      fontSize: 11,
+      color: ui.muted,
+      marginTop: 2,
+    },
+    deviceRight: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    helperCenter: {
+      textAlign: 'center',
+      fontSize: 12,
+      color: ui.muted,
+      marginTop: 10,
+    },
+    successWrap: {
+      alignItems: 'center',
+      paddingVertical: 16,
+    },
+    successIcon: {
+      width: 64,
+      height: 64,
+      borderRadius: 999,
+      backgroundColor: ui.successSoft || '#DCFCE7',
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginBottom: 14,
+    },
+    successTitle: {
+      fontSize: 20,
+      fontWeight: '800',
+      color: ui.text,
+      marginBottom: 6,
+      textAlign: 'center',
+    },
+    successSub: {
+      fontSize: 14,
+      color: ui.text,
+      marginBottom: 4,
+    },
+    successId: {
+      fontSize: 11,
+      color: ui.muted,
+      marginBottom: 8,
+    },
+    skipWrap: {
+      marginTop: 18,
+      alignItems: 'center',
+    },
+    skipText: {
+      fontSize: 13,
+      color: ui.muted,
+      fontWeight: '600',
+    },
+    signalBars: {
+      flexDirection: 'row',
+      alignItems: 'flex-end',
+      gap: 2,
+      height: 18,
+    },
+    signalBar: {
+      width: 3,
+      borderRadius: 999,
+    },
+  });

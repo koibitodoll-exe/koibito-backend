@@ -259,4 +259,60 @@ router.post("/google", async (req, res) => {
   }
 });
 
+router.post("/forgot-password", async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ message: "Email is required" });
+  }
+
+  try {
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const userResult = await pool.query(
+      `SELECT id, email, auth_provider FROM users WHERE email = $1`,
+      [normalizedEmail]
+    );
+
+    // Safe response so people can't sniff registered emails
+    if (userResult.rows.length === 0) {
+      return res.json({
+        message: "If that email exists, reset instructions have been sent.",
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.auth_provider === "google") {
+      return res.status(400).json({
+        message: "This account uses Google sign-in. Please continue with Google.",
+      });
+    }
+
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60); // 1 hour
+
+    await pool.query(
+      `UPDATE users
+       SET reset_password_token = $1,
+           reset_password_expires = $2
+       WHERE id = $3`,
+      [hashedToken, expiresAt, user.id]
+    );
+
+    const resetLink = `${process.env.APP_URL || "http://localhost:8082"}/reset-password?token=${rawToken}`;
+
+    console.log("PASSWORD RESET LINK:", resetLink);
+
+    res.json({
+      message: "If that email exists, reset instructions have been sent.",
+      dev_reset_link: resetLink,
+    });
+  } catch (error) {
+    console.error("Forgot password error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 module.exports = router;
