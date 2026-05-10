@@ -5,7 +5,7 @@ const pool = require("../db");
 
 // POST /pairing/start
 router.post("/start", authMiddleware, async (req, res) => {
-  const user_id = req.user?.id || req.body.user_id;
+  const user_id = req.user?.id;
 
   if (!user_id) {
     return res.status(400).json({ message: "user_id is required" });
@@ -46,7 +46,7 @@ router.get("/:session_id/devices", authMiddleware, async (req, res) => {
     }
 
     const devices = await pool.query(
-      `SELECT device_id, koibito_id, online_status, last_seen
+      `SELECT device_id, online_status, last_seen
        FROM devices
        WHERE online_status = 'online'
        ORDER BY last_seen DESC`
@@ -54,9 +54,9 @@ router.get("/:session_id/devices", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
-      devices: devices.rows.map((d) => ({
+      devices: devices.rows.map((d, index) => ({
         device_id: d.device_id,
-        name: d.koibito_id || "Koibito",
+        name: `Koibito ${index + 1}`,
         claimed: false,
         pairing_mode: true,
         online_status: d.online_status,
@@ -73,23 +73,32 @@ router.get("/:session_id/devices", authMiddleware, async (req, res) => {
 router.post("/:session_id/claim", authMiddleware, async (req, res) => {
   const { session_id } = req.params;
   const { device_id, app_device_id, app_name } = req.body;
+  const userId = req.user.id;
 
   if (!device_id || !app_device_id || !app_name) {
-    return res.status(400).json({ message: "device_id, app_device_id, and app_name are required" });
+    return res.status(400).json({
+      message: "device_id, app_device_id, and app_name are required",
+    });
   }
 
+  const client = await pool.connect();
+
   try {
-    const sessionCheck = await pool.query(
+    // 1. Validate session
+    const sessionCheck = await client.query(
       `SELECT * FROM pairing_sessions
        WHERE id = $1 AND status = 'pending' AND expires_at > NOW()`,
       [session_id]
     );
 
     if (sessionCheck.rows.length === 0) {
-      return res.status(404).json({ message: "pairing session not found or expired" });
+      return res.status(404).json({
+        message: "pairing session not found or expired",
+      });
     }
 
-    const deviceCheck = await pool.query(
+    // 2. Validate device
+    const deviceCheck = await client.query(
       `SELECT * FROM devices WHERE device_id = $1`,
       [device_id]
     );
@@ -98,7 +107,60 @@ router.post("/:session_id/claim", authMiddleware, async (req, res) => {
       return res.status(404).json({ message: "device not found" });
     }
 
-    await pool.query(
+    await client.query("BEGIN");
+
+    // 3. Create Koibito
+    const koibitoResult = await client.query(
+      `INSERT INTO koibitos (
+         user_id,
+         name,
+         paired_at,
+         created_at,
+         updated_at
+       )
+       VALUES ($1, $2, NOW(), NOW(), NOW())
+       RETURNING *`,
+      [userId, "My Koibito"]
+    );
+
+    const koibito = koibitoResult.rows[0];
+
+    // 4. Link device → koibito
+    await client.query(
+      `UPDATE devices
+       SET koibito_id = $1
+       WHERE device_id = $2`,
+      [koibito.id, device_id]
+    );
+
+// after linking device
+
+// push latest wifi
+await client.query(`
+  INSERT INTO device_commands (device_id, command_type, payload)
+  SELECT $1, 'wifi_apply', json_build_object(
+    'ssid', ssid,
+    'password_encrypted', password_encrypted
+  )
+  FROM device_network_profiles
+  WHERE user_id = $2 AND is_preferred = true
+  LIMIT 1
+`, [device_id, userId]);
+
+// push API key
+await client.query(`
+  INSERT INTO device_commands (device_id, command_type, payload)
+  SELECT $1, 'setup_apply', json_build_object(
+    'provider', provider,
+    'api_key_encrypted', api_key_encrypted
+  )
+  FROM user_api_keys
+  WHERE user_id = $2
+  LIMIT 1
+`, [device_id, userId]);
+
+    // 5. Queue setup_apply for Pi
+    await client.query(
       `INSERT INTO device_commands (device_id, command_type, payload)
        VALUES ($1, $2, $3)`,
       [
@@ -114,20 +176,27 @@ router.post("/:session_id/claim", authMiddleware, async (req, res) => {
       ]
     );
 
-    await pool.query(
+    // 6. Mark session claimed
+    await client.query(
       `UPDATE pairing_sessions
        SET status = 'claimed', claimed_device_id = $2
        WHERE id = $1`,
       [session_id, device_id]
     );
 
+    await client.query("COMMIT");
+
     res.json({
       success: true,
-      message: "device claim queued",
+      message: "device claimed and koibito created",
+      koibito,
     });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({ message: "failed to claim device" });
+    res.status(500).json({ message: "failed to complete pairing" });
+  } finally {
+    client.release();
   }
 });
 

@@ -945,7 +945,7 @@ router.put("/:id/settings/features", authMiddleware, async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_commands (device_id, command_type, payload)
-       SELECT d.device_id, 'sync_koibito_settings', $2
+       SELECT d.device_id, 'config_patch', $2
        FROM devices d
        WHERE d.koibito_id = $1`,
       [koibitoId, JSON.stringify(result.rows[0])]
@@ -997,7 +997,7 @@ router.put("/:id/settings/audio", authMiddleware, async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_commands (device_id, command_type, payload)
-       SELECT d.device_id, 'sync_audio_settings', $2
+       SELECT d.device_id, 'config_patch', $2
        FROM devices d
        WHERE d.koibito_id = $1`,
       [koibitoId, JSON.stringify(result.rows[0])]
@@ -1051,7 +1051,7 @@ router.put("/:id/settings/health", authMiddleware, async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_commands (device_id, command_type, payload)
-       SELECT d.device_id, 'sync_health_settings', $2
+       SELECT d.device_id, 'config_patch', $2
        FROM devices d
        WHERE d.koibito_id = $1`,
       [koibitoId, JSON.stringify(result.rows[0])]
@@ -1095,7 +1095,7 @@ router.put("/:id/settings/model", authMiddleware, async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_commands (device_id, command_type, payload)
-       SELECT d.device_id, 'sync_ai_model', $2
+       SELECT d.device_id, 'config_patch', $2
        FROM devices d
        WHERE d.koibito_id = $1`,
       [koibitoId, JSON.stringify(result.rows[0])]

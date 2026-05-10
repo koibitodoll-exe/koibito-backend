@@ -94,7 +94,7 @@ router.post("/wifi", authMiddleware, async (req, res) => {
     if (queue_connect && resolvedDeviceId) {
       await pool.query(
         `INSERT INTO device_commands (device_id, command_type, payload)
-         VALUES ($1, 'connect_wifi', $2)`,
+         VALUES ($1, 'wifi_apply', $2)`,
         [
           resolvedDeviceId,
           JSON.stringify({
@@ -151,7 +151,7 @@ router.post("/wifi/connect", authMiddleware, async (req, res) => {
 
     await pool.query(
       `INSERT INTO device_commands (device_id, command_type, payload)
-       VALUES ($1, 'connect_wifi', $2)`,
+       VALUES ($1, 'wifi_apply', $2)`,
       [
         profile.device_id,
         JSON.stringify({
@@ -197,7 +197,7 @@ router.post("/api-key", authMiddleware, async (req, res) => {
     if (koibito_id) {
       await pool.query(
         `INSERT INTO device_commands (device_id, command_type, payload)
-         SELECT d.device_id, 'sync_api_key', $2
+         SELECT d.device_id, 'setup_apply', $2
          FROM devices d
          JOIN koibitos k ON k.id = d.koibito_id
          WHERE k.id = $1 AND k.user_id = $3`,

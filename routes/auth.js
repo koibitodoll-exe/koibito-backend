@@ -18,7 +18,7 @@ function generateContactCode() {
 function signUserToken(user) {
   return jwt.sign(
     { id: user.id, email: user.email },
-    "supersecretkey",
+    process.env.JWT_SECRET,
     { expiresIn: "7d" }
   );
 }
@@ -27,6 +27,7 @@ function buildUserResponse(user) {
   return {
     id: user.id,
     email: user.email,
+    name: user.full_name,
     full_name: user.full_name,
     username: user.username,
     contact_code: user.contact_code,
@@ -35,23 +36,34 @@ function buildUserResponse(user) {
 }
 
 router.post("/register", async (req, res) => {
-  const { email, password, full_name, username } = req.body;
+  const { email, password, name, full_name, username } = req.body;
 
-  if (!email || !password || !full_name || !username) {
-    return res.status(400).json({ message: "Email, password, full name, and username are required" });
+  const cleanedFullName = (name || full_name || "").trim();
+
+  if (!email || !password || !cleanedFullName || !username) {
+    return res.status(400).json({
+      message: "Email, password, name, and username are required",
+    });
   }
 
   try {
     const normalizedEmail = email.trim().toLowerCase();
     const normalizedUsername = username.trim().toLowerCase();
-    const cleanedFullName = full_name.trim();
 
-    const existingUserByEmail = await pool.query(`SELECT id FROM users WHERE email = $1`, [normalizedEmail]);
+    const existingUserByEmail = await pool.query(
+      `SELECT id FROM users WHERE email = $1`,
+      [normalizedEmail]
+    );
+
     if (existingUserByEmail.rows.length > 0) {
       return res.status(400).json({ message: "Email already exists" });
     }
 
-    const existingUserByUsername = await pool.query(`SELECT id FROM users WHERE username = $1`, [normalizedUsername]);
+    const existingUserByUsername = await pool.query(
+      `SELECT id FROM users WHERE username = $1`,
+      [normalizedUsername]
+    );
+
     if (existingUserByUsername.rows.length > 0) {
       return res.status(400).json({ message: "Username already exists" });
     }
@@ -63,10 +75,24 @@ router.post("/register", async (req, res) => {
       `INSERT INTO users (email, password, contact_code, full_name, username, auth_provider)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, email, contact_code, full_name, username, auth_provider`,
-      [normalizedEmail, hashedPassword, contactCode, cleanedFullName, normalizedUsername, "local"]
+      [
+        normalizedEmail,
+        hashedPassword,
+        contactCode,
+        cleanedFullName,
+        normalizedUsername,
+        "local",
+      ]
     );
 
-    res.json({ message: "User registered", user: buildUserResponse(result.rows[0]) });
+    const user = result.rows[0];
+    const token = signUserToken(user);
+
+    res.json({
+      message: "User registered",
+      token,
+      user: buildUserResponse(user),
+    });
   } catch (error) {
     console.error("Register error:", error);
     res.status(500).json({ message: "Server error" });
@@ -82,7 +108,9 @@ router.post("/login", async (req, res) => {
 
   try {
     const normalizedEmail = email.trim().toLowerCase();
-    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [normalizedEmail]);
+    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [
+      normalizedEmail,
+    ]);
 
     if (result.rows.length === 0) {
       return res.status(400).json({ message: "Invalid credentials" });
@@ -91,16 +119,24 @@ router.post("/login", async (req, res) => {
     const user = result.rows[0];
 
     if (!user.password) {
-      return res.status(400).json({ message: "This account uses Google sign-in. Please continue with Google." });
+      return res.status(400).json({
+        message: "This account uses Google sign-in. Please continue with Google.",
+      });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
+
     if (!isMatch) {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
     const token = signUserToken(user);
-    res.json({ message: "Login successful", token, user: buildUserResponse(user) });
+
+    res.json({
+      message: "Login successful",
+      token,
+      user: buildUserResponse(user),
+    });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ message: "Server error" });
@@ -125,6 +161,7 @@ router.post("/google", async (req, res) => {
     });
 
     const payload = ticket.getPayload();
+
     if (!payload) {
       return res.status(400).json({ message: "Invalid Google token" });
     }
@@ -134,7 +171,9 @@ router.post("/google", async (req, res) => {
     const fullName = payload.name?.trim() || null;
 
     if (!googleId || !email) {
-      return res.status(400).json({ message: "Google account data is incomplete" });
+      return res.status(400).json({
+        message: "Google account data is incomplete",
+      });
     }
 
     let userResult = await pool.query(
@@ -156,8 +195,13 @@ router.post("/google", async (req, res) => {
       let counter = 1;
 
       while (true) {
-        const existingUsername = await pool.query(`SELECT id FROM users WHERE username = $1`, [username]);
+        const existingUsername = await pool.query(
+          `SELECT id FROM users WHERE username = $1`,
+          [username]
+        );
+
         if (existingUsername.rows.length === 0) break;
+
         username = `${baseUsername}${counter}`;
         counter += 1;
       }
@@ -218,13 +262,17 @@ router.post("/forgot-password", async (req, res) => {
     );
 
     if (userResult.rows.length === 0) {
-      return res.json({ message: "If that email exists, reset instructions have been sent." });
+      return res.json({
+        message: "If that email exists, reset instructions have been sent.",
+      });
     }
 
     const user = userResult.rows[0];
 
     if (user.auth_provider === "google") {
-      return res.status(400).json({ message: "This account uses Google sign-in. Please continue with Google." });
+      return res.status(400).json({
+        message: "This account uses Google sign-in. Please continue with Google.",
+      });
     }
 
     const rawToken = crypto.randomBytes(32).toString("hex");
@@ -241,11 +289,20 @@ router.post("/forgot-password", async (req, res) => {
 
     const resetLink = `https://koibito-backend.onrender.com/auth/reset-password?token=${rawToken}`;
 
-    console.log("RESET LINK:", resetLink);
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || "Koibito <onboarding@resend.dev>",
+      to: [user.email],
+      subject: "Reset your Koibito password",
+      html: `
+        <h2>Reset your password</h2>
+        <p>Click below to create a new password:</p>
+        <a href="${resetLink}">Reset Password</a>
+        <p>This link expires in 1 hour.</p>
+      `,
+    });
 
     res.json({
-      message: "Reset link generated",
-      dev_reset_link: resetLink,
+      message: "Reset instructions have been sent.",
     });
   } catch (error) {
     console.error("Forgot password error:", error);

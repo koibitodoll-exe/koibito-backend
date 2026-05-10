@@ -29,14 +29,46 @@ const pairingRoutes = require("./routes/pairing");
 const koibitoChatRoutes = require("./routes/koibitoChat");
 const userMoodRoutes = require("./routes/userMood");
 
-
-
-
-
 // Parse JSON FIRST
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Debug mode
+app.get("/ping", (req, res) => {
+  res.json({
+    ok: true,
+    service: "koibito-backend",
+    time: new Date().toISOString(),
+  });
+});
+
+app.use((req, res, next) => {
+  console.log("📩 REQ:", req.method, req.originalUrl);
+
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log("📦 BODY:", JSON.stringify(req.body, null, 2));
+  }
+
+  next();
+});
+
+// Basic routes
+app.get("/", (req, res) => {
+  res.send("Koibito backend running");
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", service: "koibito-backend" });
+});
+
+app.get("/profile", authMiddleware, (req, res) => {
+  res.json({
+    message: "Protected profile data",
+    user: req.user,
+  });
+});
+
+// Routes
 app.use("/voices", voiceRoutes);
 app.use("/friends", friendRoutes);
 app.use("/groups", groupRoutes);
@@ -56,15 +88,6 @@ app.use("/chat", koibitoChatRoutes);
 app.use("/user", userMoodRoutes);
 app.use("/voice-providers", require("./routes/voice-providers"));
 
-
-
-// Logger
-app.use((req, res, next) => {
-  console.log(req.method, req.url);
-  next();
-});
-
-// Routes
 app.use("/auth", authRoutes);
 app.use("/chat", chatRoutes);
 app.use("/memories", memoryRoutes);
@@ -73,22 +96,8 @@ app.use("/koibitos", koibitoRoutes);
 app.use("/device", deviceRoutes);
 app.use("/", traitRoutes);
 
-// Basic routes
-app.get("/", (req, res) => {
-  res.send("Koibito backend running");
-});
+const PORT = process.env.PORT || 3000;
 
-app.get("/profile", authMiddleware, (req, res) => {
-  res.json({
-    message: "Protected profile data",
-    user: req.user
-  });
-});
-
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "koibito-backend" });
-});
-
-app.listen(3000, () => {
-  console.log("Server running on port 3000");
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

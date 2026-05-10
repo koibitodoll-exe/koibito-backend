@@ -3,13 +3,6 @@ const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
 const pool = require("../db");
 
-let deviceSetupState = {
-  status: "setup_mode",
-  ssid: null,
-  ip: null,
-  success: false
-};
-
 function normalizeBatteryPercent(value) {
   if (value === undefined || value === null || value === "") return null;
   const num = Number(value);
@@ -29,47 +22,69 @@ function normalizeBatteryVoltage(value) {
 function normalizeCharging(value) {
   if (value === undefined || value === null) return null;
   if (typeof value === "boolean") return value;
+
   if (typeof value === "string") {
     const lowered = value.trim().toLowerCase();
     if (["true", "1", "yes", "charging"].includes(lowered)) return true;
     if (["false", "0", "no", "not_charging"].includes(lowered)) return false;
   }
+
   if (typeof value === "number") return value !== 0;
   return null;
 }
 
-router.post("/setup-wifi", authMiddleware, (req, res) => {
+// App queues Wi-Fi setup command for Pi
+router.post("/:device_id/setup-wifi", authMiddleware, async (req, res) => {
+  const { device_id } = req.params;
   const { ssid, password } = req.body;
 
   if (!ssid || !password) {
     return res.status(400).json({ message: "ssid and password are required" });
   }
 
-  deviceSetupState = {
-    status: "connected",
-    ssid,
-    ip: "192.168.1.20",
-    success: true
-  };
+  try {
+    const deviceCheck = await pool.query(
+      `SELECT * FROM devices WHERE device_id = $1`,
+      [device_id]
+    );
 
-  res.json({
-    success: true,
-    ip: deviceSetupState.ip,
-    message: "Connected to Wi-Fi"
-  });
+    if (deviceCheck.rows.length === 0) {
+      return res.status(404).json({ message: "device not found" });
+    }
+
+    const payload = {
+      ssid,
+      password,
+      source: "app_setup_wifi",
+      submitted_at: new Date().toISOString(),
+    };
+
+    const result = await pool.query(
+      `INSERT INTO device_commands (device_id, command_type, payload)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [device_id, "wifi_apply", JSON.stringify(payload)]
+    );
+
+    res.json({
+      success: true,
+      message: "Wi-Fi setup command queued",
+      command: result.rows[0],
+    });
+  } catch (err) {
+    console.error("setup-wifi failed:", err);
+    res.status(500).json({ message: "failed to queue Wi-Fi setup" });
+  }
 });
 
-router.get("/setup-status", authMiddleware, (req, res) => {
-  res.json(deviceSetupState);
-});
-
+// Pi heartbeat
 router.post("/device-heartbeat", async (req, res) => {
   const {
     device_id,
     online_status,
     battery_percent,
     battery_voltage,
-    is_charging
+    is_charging,
   } = req.body;
 
   if (!device_id) {
@@ -100,7 +115,7 @@ router.post("/device-heartbeat", async (req, res) => {
         derivedStatus,
         normalizedBatteryPercent,
         normalizedBatteryVoltage,
-        normalizedCharging
+        normalizedCharging,
       ]
     );
 
@@ -117,11 +132,7 @@ router.post("/device-heartbeat", async (req, res) => {
              status = COALESCE($3, status),
              updated_at = NOW()
          WHERE id = $1`,
-        [
-          device.koibito_id,
-          normalizedBatteryPercent,
-          derivedStatus
-        ]
+        [device.koibito_id, normalizedBatteryPercent, derivedStatus]
       );
     }
 
@@ -131,17 +142,19 @@ router.post("/device-heartbeat", async (req, res) => {
       device,
     });
   } catch (err) {
-    console.error(err);
+    console.error("heartbeat failed:", err);
     res.status(500).json({ message: "heartbeat failed" });
   }
 });
 
+// App gets device status
 router.get("/:device_id/status", async (req, res) => {
   const { device_id } = req.params;
 
   try {
     const result = await pool.query(
-      `SELECT device_id, koibito_id, online_status, battery_percent, battery_voltage, is_charging, last_seen
+      `SELECT device_id, koibito_id, online_status, battery_percent,
+              battery_voltage, is_charging, last_seen
        FROM devices
        WHERE device_id = $1`,
       [device_id]
@@ -156,11 +169,12 @@ router.get("/:device_id/status", async (req, res) => {
       device: result.rows[0],
     });
   } catch (err) {
-    console.error(err);
+    console.error("status failed:", err);
     res.status(500).json({ message: "failed to get device status" });
   }
 });
 
+// Pi fetches pending commands
 router.get("/:device_id/commands", async (req, res) => {
   const { device_id } = req.params;
 
@@ -174,14 +188,15 @@ router.get("/:device_id/commands", async (req, res) => {
 
     res.json({
       success: true,
-      commands: result.rows
+      commands: result.rows,
     });
   } catch (err) {
-    console.error(err);
+    console.error("fetch commands failed:", err);
     res.status(500).json({ message: "failed to fetch commands" });
   }
 });
 
+// App/backend queues any device command
 router.post("/:device_id/command", async (req, res) => {
   const { device_id } = req.params;
   const { command_type, payload } = req.body;
@@ -213,11 +228,12 @@ router.post("/:device_id/command", async (req, res) => {
       command: result.rows[0],
     });
   } catch (err) {
-    console.error(err);
+    console.error("queue command failed:", err);
     res.status(500).json({ message: "failed to queue command" });
   }
 });
 
+// Pi marks command complete
 router.post("/command/:command_id/complete", async (req, res) => {
   const { command_id } = req.params;
 
@@ -237,11 +253,10 @@ router.post("/command/:command_id/complete", async (req, res) => {
     res.json({
       success: true,
       message: "command marked completed",
-      command: result.rows[0]
+      command: result.rows[0],
     });
-
   } catch (err) {
-    console.error(err);
+    console.error("complete command failed:", err);
     res.status(500).json({ message: "failed to update command" });
   }
 });
