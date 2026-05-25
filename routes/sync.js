@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const auth = require('../middleware/authMiddleware');
+const authMiddleware = require('../middleware/authMiddleware');
 const pool = require('../db');
 
 router.get('/:koibitoId', authMiddleware, async (req, res) => {
