@@ -3,7 +3,7 @@ const router = express.Router();
 const pool = require('../db');
 const authMiddleware = require("../middleware/authMiddleware");
 
-router.get('/user/badges', auth, async (req, res) => {
+router.get('/user/badges', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
 
