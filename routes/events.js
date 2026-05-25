@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
-const auth = require('../middleware/auth');
+const authMiddleware = require("../middleware/authMiddleware");
 
 const { processEvent } = require('../services/eventProcessor');
 const { processEqFromEvent } = require('../services/eqEngine');
@@ -23,7 +23,7 @@ const diaryEvents = {
 };
 
 // POST /events
-router.post('/', auth, async (req, res) => {
+router.post('/', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
 
@@ -93,7 +93,7 @@ router.post('/', auth, async (req, res) => {
 });
 
 // GET /events/recent
-router.get('/recent', auth, async (req, res) => {
+router.get('/recent', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const limit = Math.min(parseInt(req.query.limit || '50', 10), 100);
