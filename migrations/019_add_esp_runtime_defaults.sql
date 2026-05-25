@@ -1,0 +1,11 @@
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS network_type TEXT;
+
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS signal_strength INTEGER;
+
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS sim_status TEXT;
+
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS runtime_mode TEXT DEFAULT 'standard';

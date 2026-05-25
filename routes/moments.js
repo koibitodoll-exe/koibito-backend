@@ -3,6 +3,18 @@ const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 const notify = require("../utils/notify");
+const multer = require("multer");
+const path = require("path");
+const supabase = require("../lib/supabase");
+const { processEvent } = require("../services/eventProcessor");
+
+const momentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 8 * 1024 * 1024, // 8MB
+  },
+});
+
 
 // GET /moments/feed
 router.get("/feed", authMiddleware, async (req, res) => {
@@ -22,6 +34,78 @@ router.get("/feed", authMiddleware, async (req, res) => {
     res.status(500).json({ message: "Failed to fetch moments feed" });
   }
 });
+
+// POST /moments/upload
+router.post(
+  "/upload",
+  authMiddleware,
+  momentUpload.single("file"),
+  async (req, res) => {
+    const userId = req.user.id;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({
+        success: false,
+        message: "file is required",
+      });
+    }
+
+    if (!file.mimetype || !file.mimetype.startsWith("image/")) {
+      return res.status(400).json({
+        success: false,
+        message: "Only image uploads are allowed for moments",
+      });
+    }
+
+    try {
+      const originalName = file.originalname || "moment";
+      const ext = path.extname(originalName) || ".jpg";
+      const safeBaseName = path
+        .basename(originalName, ext)
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_-]/g, "");
+
+      const finalFileName = `${Date.now()}_${safeBaseName || "moment"}${ext}`;
+      const storagePath = `moments/${userId}/${finalFileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(process.env.SUPABASE_BUCKET)
+        .upload(storagePath, file.buffer, {
+          contentType: file.mimetype,
+          upsert: false,
+        });
+
+      if (uploadError) {
+        console.error("Supabase moment upload error:", uploadError);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to upload moment image",
+          detail: uploadError.message || null,
+        });
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from(process.env.SUPABASE_BUCKET)
+        .getPublicUrl(storagePath);
+
+      const mediaUrl = publicUrlData?.publicUrl || null;
+
+      return res.json({
+        success: true,
+        message: "Moment image uploaded",
+        media_url: mediaUrl,
+        storage_path: storagePath,
+      });
+    } catch (err) {
+      console.error("POST /moments/upload error:", err);
+      return res.status(500).json({
+        success: false,
+        message: err.message || "Failed to upload moment image",
+      });
+    }
+  }
+);
 
 // POST /moments/post
 router.post("/post", authMiddleware, async (req, res) => {
@@ -73,6 +157,17 @@ router.post("/post", authMiddleware, async (req, res) => {
           koibito_id: finalAuthorId,
         }
       );
+    }
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: author_type === 'koibito' ? finalAuthorId : null,
+        event_type: 'activity.moment_posted',
+        source: 'moments',
+      });
+    } catch(eventErr){
+      console.warn('[moments] event processing failed:', eventErr.message);
     }
 
     res.json({

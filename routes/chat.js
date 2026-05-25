@@ -2,6 +2,55 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { generateReply } = require("../services/cloudBrain");
+const { emitChatRoomUpdate } = require("../services/liveSync");
+const { processEvent } = require('../services/eventProcessor');
+
+async function processChatEvent(event) {
+  try {
+    await pool.query(
+      `INSERT INTO interaction_events (user_id, koibito_id, event_type, source, payload, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [
+        event.userId || null,
+        event.koibitoId || null,
+        event.eventType || 'chat.message.created',
+        event.source || event.channel || 'chat',
+        JSON.stringify({
+          channel: event.channel,
+          message: event.message,
+          sender_type: event.senderType,
+          room_id: event.roomId,
+          group_id: event.groupId,
+          session_id: event.sessionId,
+          metadata: event.metadata || {},
+        }),
+      ]
+    );
+  } catch (error) {
+    console.log('interaction_events insert skipped:', error.message);
+  }
+
+  if (event.skipReply || !event.koibitoId || !event.userId || !event.message) {
+    return { replyText: null };
+  }
+
+  try {
+    const brainResult = await generateReply({
+      koibitoId: event.koibitoId,
+      userId: event.userId,
+      userMessage: event.message,
+    });
+
+    return {
+      replyText: brainResult?.reply || null,
+      packet: brainResult?.packet || null,
+    };
+  } catch (error) {
+    console.log('Cloud Brain generateReply skipped:', error.message);
+    return { replyText: null };
+  }
+}
 
 // POST /chat/rooms
 router.post("/rooms", authMiddleware, async (req, res) => {
@@ -134,10 +183,46 @@ router.post("/rooms/:id/message", authMiddleware, async (req, res) => {
       [roomId, userId, message_text, media_url, message_type, action_type, target_id]
     );
 
+    const chatMessage = result.rows[0];
+
+    await processChatEvent({
+      source: 'user_chat',
+      channel: 'user_chat',
+      eventType: 'chat.user_message.created',
+      userId,
+      roomId,
+      message: message_text,
+      senderType: 'user',
+      skipReply: true,
+      metadata: {
+        media_url,
+        message_type,
+        action_type,
+        target_id,
+        chat_message: chatMessage,
+      },
+    });
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: null,
+        event_type: 'chat.message_sent',
+        source: 'chat_message',
+      });
+    } catch (eventErr) {
+      console.warn('[chat] event processing failed:', eventErr.message);
+    }
+
+
+    if (typeof emitChatRoomUpdate === 'function') {
+      emitChatRoomUpdate(roomId, 'message_created', { message: chatMessage });
+    }
+
     res.json({
       success: true,
       message: "Message sent",
-      chat_message: result.rows[0],
+      chat_message: chatMessage,
     });
   } catch (err) {
     console.error(err);
@@ -271,6 +356,92 @@ router.patch("/settings", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to update chat settings" });
+  }
+});
+
+// GET /chat/thread/:participantId
+router.get("/thread/:participantId", authMiddleware, async (req, res) => {
+  const userId = parseInt(req.user.id, 10);
+  const participantId = parseInt(req.params.participantId, 10);
+
+  if (!Number.isInteger(participantId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid participantId",
+    });
+  }
+
+  try {
+    // find existing direct room containing BOTH users
+    const roomResult = await pool.query(
+      `
+      SELECT cr.*
+      FROM chat_rooms cr
+      JOIN chat_participants cp1
+        ON cp1.room_id = cr.id
+      JOIN chat_participants cp2
+        ON cp2.room_id = cr.id
+      WHERE cr.room_type='direct'
+        AND cp1.participant_type='user'
+        AND cp1.participant_id=$1
+        AND cp2.participant_type='user'
+        AND cp2.participant_id=$2
+      LIMIT 1
+      `,
+      [userId, participantId]
+    );
+
+    let room;
+
+    if (roomResult.rows.length > 0) {
+      room = roomResult.rows[0];
+    } else {
+      // create room
+      const newRoom = await pool.query(
+        `
+        INSERT INTO chat_rooms (room_type)
+        VALUES ('direct')
+        RETURNING *
+        `
+      );
+
+      room = newRoom.rows[0];
+
+      await pool.query(
+        `
+        INSERT INTO chat_participants
+        (room_id, participant_type, participant_id)
+        VALUES
+        ($1,'user',$2),
+        ($1,'user',$3)
+        `,
+        [room.id, userId, participantId]
+      );
+    }
+
+    const messages = await pool.query(
+      `
+      SELECT *
+      FROM chat_messages
+      WHERE room_id=$1
+      ORDER BY created_at ASC
+      `,
+      [room.id]
+    );
+
+    res.json({
+      success:true,
+      room,
+      messages:messages.rows
+    });
+
+  } catch(err){
+    console.error(err);
+
+    res.status(500).json({
+      success:false,
+      message:"Failed loading thread"
+    });
   }
 });
 

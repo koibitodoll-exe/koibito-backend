@@ -1,0 +1,11 @@
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS device_type TEXT DEFAULT 'pi';
+
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS runtime TEXT DEFAULT 'raspberry_pi';
+
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS capabilities JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE devices
+ADD COLUMN IF NOT EXISTS firmware_version TEXT;

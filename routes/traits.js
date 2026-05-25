@@ -2,6 +2,8 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { syncSoulPacket } = require("../services/soulPacketSync");
+const { processEvent } = require("../services/eventProcessor");
 
 function normalizeTraitLabel(value) {
   return String(value || "")
@@ -39,110 +41,6 @@ async function ensureUniqueTraitKey(client, baseKey) {
     if (check.rows.length === 0) return candidate;
     counter += 1;
   }
-}
-
-async function queueConfigPatchForKoibito(koibitoId) {
-  const koibitoResult = await pool.query(
-    `SELECT
-       k.id,
-       k.name,
-       k.avatar,
-       k.gender,
-       COALESCE(k.is_primary, false) AS is_primary
-     FROM koibitos k
-     WHERE k.id = $1`,
-    [koibitoId]
-  );
-
-  if (koibitoResult.rows.length === 0) return;
-
-  const koibito = koibitoResult.rows[0];
-
-  const aliasesResult = await pool.query(
-    `SELECT aliases
-     FROM koibito_aliases
-     WHERE koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const rulesResult = await pool.query(
-    `SELECT must_rules, never_rules, character_rule
-     FROM koibito_rules
-     WHERE koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const traitsResult = await pool.query(
-    `SELECT td.label
-     FROM koibito_traits kt
-     JOIN trait_definitions td ON td.id = kt.trait_id
-     WHERE kt.koibito_id = $1
-     ORDER BY td.label ASC`,
-    [koibitoId]
-  );
-
-  const voiceResult = await pool.query(
-    `SELECT
-       vp.id,
-       vp.voice_key,
-       vp.label,
-       vp.provider
-     FROM koibito_voice_settings kvs
-     JOIN voice_profiles vp ON vp.id = kvs.voice_profile_id
-     WHERE kvs.koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const settingsResult = await pool.query(
-    `SELECT profanity_mode
-     FROM koibito_settings
-     WHERE koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const aliases = aliasesResult.rows[0]?.aliases || [];
-  const rules = rulesResult.rows[0] || {
-    must_rules: [],
-    never_rules: [],
-    character_rule: "",
-  };
-  const traits = traitsResult.rows.map((row) => row.label);
-  const voice = voiceResult.rows[0] || null;
-  const profanity_mode = settingsResult.rows[0]?.profanity_mode ?? false;
-
-  const payload = {
-    koibito_id: koibito.id,
-    patch: {
-      doll_profile: {
-        name: koibito.name,
-        avatar: koibito.avatar,
-        gender: koibito.gender,
-        is_primary: koibito.is_primary,
-        aliases,
-        traits,
-        must_rules: rules.must_rules || [],
-        never_rules: rules.never_rules || [],
-        character_rule: rules.character_rule || "",
-        profanity_allowed: profanity_mode,
-        voice: voice
-          ? {
-              id: voice.id,
-              voice_key: voice.voice_key,
-              label: voice.label,
-              provider: voice.provider,
-            }
-          : null,
-      },
-    },
-  };
-
-  await pool.query(
-    `INSERT INTO device_commands (device_id, command_type, payload)
-     SELECT d.device_id, 'config_patch', $2
-     FROM devices d
-     WHERE d.koibito_id = $1`,
-    [koibitoId, JSON.stringify(payload)]
-  );
 }
 
 // GET /traits
@@ -278,11 +176,22 @@ router.put("/koibitos/:id/traits", authMiddleware, async (req, res) => {
 
     await client.query("COMMIT");
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: koibitoId,
+        event_type: 'koibito.profile_edited',
+        source: 'traits',
+      });
+    } catch(eventErr){
+      console.warn('[traits] event processing failed:', eventErr.message);
+    }
 
     res.json({
       success: true,
-      message: "Traits updated and config patch queued",
+      message: "Traits updated and Soul Packet synced",
       traits: result.rows,
     });
   } catch (err) {

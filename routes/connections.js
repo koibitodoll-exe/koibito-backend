@@ -268,35 +268,93 @@ router.get("/bluetooth", authMiddleware, async (req, res) => {
 
 // POST /connections/bluetooth/pair
 router.post("/bluetooth/pair", authMiddleware, async (req, res) => {
-  const { device_id, name, type = "unknown", battery_level = null } = req.body;
+  const userId = req.user.id;
 
-  if (!device_id || !name) {
-    return res.status(400).json({ message: "device_id and name are required" });
+  const {
+    device_id = null,
+    koibito_id = null,
+    name,
+    type = "unknown",
+    battery_level = null,
+  } = req.body;
+
+  if (!name) {
+    return res.status(400).json({
+      message: "name required",
+    });
   }
 
   try {
+    let resolvedDeviceId = device_id;
+
+    if (!resolvedDeviceId && koibito_id) {
+      const deviceResult = await pool.query(
+        `SELECT d.device_id
+         FROM devices d
+         JOIN koibitos k
+         ON d.koibito_id = k.id
+         WHERE k.id = $1
+         AND k.user_id = $2
+         LIMIT 1`,
+        [koibito_id, userId]
+      );
+
+      if (deviceResult.rows.length > 0) {
+        resolvedDeviceId =
+          deviceResult.rows[0].device_id;
+      }
+    }
+
+    if (!resolvedDeviceId) {
+      return res.status(404).json({
+        message: "Koibito device not found",
+      });
+    }
+
     const result = await pool.query(
       `INSERT INTO bluetooth_devices
-       (device_id, name, type, battery_level, paired, updated_at)
-       VALUES ($1, $2, $3, $4, TRUE, NOW())
-       ON CONFLICT (device_id)
+       (
+        device_id,
+        name,
+        type,
+        battery_level,
+        paired,
+        updated_at
+       )
+       VALUES
+       ($1,$2,$3,$4,TRUE,NOW())
+
+       ON CONFLICT(device_id)
+
        DO UPDATE SET
-         name = EXCLUDED.name,
-         type = EXCLUDED.type,
-         battery_level = EXCLUDED.battery_level,
-         paired = TRUE,
-         updated_at = NOW()
+       name=EXCLUDED.name,
+       type=EXCLUDED.type,
+       battery_level=EXCLUDED.battery_level,
+       paired=TRUE,
+       updated_at=NOW()
+
        RETURNING *`,
-      [device_id, name, type, battery_level]
+      [
+        resolvedDeviceId,
+        name,
+        type,
+        battery_level,
+      ]
     );
 
     await pool.query(
-      `INSERT INTO device_commands (device_id, command_type, payload)
-       VALUES ($1, 'bluetooth_pair', $2)`,
+      `INSERT INTO device_commands
+      (
+       device_id,
+       command_type,
+       payload
+      )
+      VALUES
+      ($1,$2,$3)`,
       [
-        device_id,
+        resolvedDeviceId,
+        "bluetooth_pair",
         JSON.stringify({
-          device_id,
           name,
           type,
         }),
@@ -306,11 +364,17 @@ router.post("/bluetooth/pair", authMiddleware, async (req, res) => {
     res.json({
       success: true,
       message: "Bluetooth pair queued",
-      bluetooth_device: result.rows[0],
+      bluetooth_device:
+        result.rows[0],
     });
+
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Failed to pair bluetooth device" });
+
+    res.status(500).json({
+      message:
+      "Failed to pair bluetooth device",
+    });
   }
 });
 
@@ -395,6 +459,108 @@ router.post("/bluetooth/reconnect", authMiddleware, async (req, res) => {
     console.error(err);
     res.status(500).json({ message: "Failed to reconnect bluetooth device" });
   }
+});
+
+// POST /connections/bluetooth/scan
+router.post(
+"/bluetooth/scan",
+authMiddleware,
+async(req,res)=>{
+
+ const userId=req.user.id;
+ const {koibito_id}=req.body;
+
+ if(!koibito_id){
+
+   return res.status(400).json({
+     message:"koibito_id required"
+   });
+
+ }
+
+ try{
+
+   const deviceResult=
+   await pool.query(
+
+   `
+   SELECT d.device_id
+   FROM devices d
+
+   JOIN koibitos k
+   ON d.koibito_id=k.id
+
+   WHERE
+   k.id=$1
+   AND
+   k.user_id=$2
+
+   LIMIT 1
+   `,
+
+   [
+    koibito_id,
+    userId
+   ]
+
+   );
+
+   if(
+     deviceResult.rows.length===0
+   ){
+
+     return res.status(404).json({
+       message:
+       "Koibito device not found"
+     });
+
+   }
+
+   const deviceId=
+   deviceResult.rows[0]
+   .device_id;
+
+   await pool.query(
+
+   `
+   INSERT INTO device_commands
+   (
+    device_id,
+    command_type,
+    payload
+   )
+   VALUES
+   ($1,$2,$3)
+   `,
+
+   [
+     deviceId,
+     "bluetooth_scan",
+     JSON.stringify({})
+   ]
+
+   );
+
+   res.json({
+
+     success:true,
+     message:
+     "Bluetooth scan queued"
+
+   });
+
+ }
+ catch(err){
+
+   console.error(err);
+
+   res.status(500).json({
+     message:
+     "Failed to scan bluetooth"
+   });
+
+ }
+
 });
 
 module.exports = router;

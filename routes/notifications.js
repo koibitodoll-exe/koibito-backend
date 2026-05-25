@@ -9,10 +9,22 @@ router.get("/", authMiddleware, async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, user_id, type, title, body, related_device_id, is_read, created_at
-       FROM notifications
-       WHERE user_id = $1
-       ORDER BY created_at DESC`,
+      `
+      SELECT
+        id,
+        user_id,
+        type,
+        title,
+        body,
+        action_route,
+        metadata,
+        is_read,
+        read_at,
+        created_at
+      FROM notifications
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      `,
       [userId]
     );
 
@@ -22,7 +34,10 @@ router.get("/", authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Failed to fetch notifications" });
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch notifications",
+    });
   }
 });
 
@@ -32,20 +47,31 @@ router.post("/read", authMiddleware, async (req, res) => {
   const { notification_id } = req.body;
 
   if (!notification_id) {
-    return res.status(400).json({ message: "notification_id is required" });
+    return res.status(400).json({
+      success: false,
+      message: "notification_id is required",
+    });
   }
 
   try {
     const result = await pool.query(
-      `UPDATE notifications
-       SET is_read = TRUE
-       WHERE id = $1 AND user_id = $2
-       RETURNING *`,
+      `
+      UPDATE notifications
+      SET
+        is_read = TRUE,
+        read_at = NOW()
+      WHERE id = $1
+        AND user_id = $2
+      RETURNING *
+      `,
       [notification_id, userId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: "Notification not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Notification not found",
+      });
     }
 
     res.json({
@@ -55,7 +81,10 @@ router.post("/read", authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Failed to update notification" });
+    res.status(500).json({
+      success: false,
+      message: "Failed to update notification",
+    });
   }
 });
 
@@ -65,9 +94,14 @@ router.post("/read-all", authMiddleware, async (req, res) => {
 
   try {
     await pool.query(
-      `UPDATE notifications
-       SET is_read = TRUE
-       WHERE user_id = $1 AND is_read = FALSE`,
+      `
+      UPDATE notifications
+      SET
+        is_read = TRUE,
+        read_at = NOW()
+      WHERE user_id = $1
+        AND is_read = FALSE
+      `,
       [userId]
     );
 
@@ -77,7 +111,75 @@ router.post("/read-all", authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Failed to update notifications" });
+    res.status(500).json({
+      success: false,
+      message: "Failed to update notifications",
+    });
+  }
+});
+
+// DELETE /notifications/clear-all
+router.delete("/clear-all", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const result = await pool.query(
+      `
+      DELETE FROM notifications
+      WHERE user_id = $1
+      RETURNING id
+      `,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      message: "All notifications deleted",
+      deleted_count: result.rowCount || 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete notifications",
+    });
+  }
+});
+
+// DELETE /notifications/:id
+router.delete("/:id", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const notificationId = req.params.id;
+
+  try {
+    const result = await pool.query(
+      `
+      DELETE FROM notifications
+      WHERE id = $1
+        AND user_id = $2
+      RETURNING id
+      `,
+      [notificationId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Notification not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Notification deleted",
+      notification_id: result.rows[0].id,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete notification",
+    });
   }
 });
 

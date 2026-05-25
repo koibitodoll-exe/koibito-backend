@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { processEvent } = require("../services/eventProcessor");
 
 // GET /friends/requests
 router.get("/requests", authMiddleware, async (req, res) => {
@@ -37,24 +38,48 @@ router.get("/requests", authMiddleware, async (req, res) => {
 router.post("/request", authMiddleware, async (req, res) => {
   const senderUserId = req.user.id;
   const receiver_user_id = req.body?.receiver_user_id;
+  const contact_code = req.body?.contact_code?.trim()?.toUpperCase();
 
   console.log("content-type:", req.headers["content-type"]);
   console.log("req.body:", req.body);
 
-  if (!receiver_user_id) {
-    return res.status(400).json({ message: "receiver_user_id is required" });
-  }
-
-  if (Number(receiver_user_id) === Number(senderUserId)) {
-    return res.status(400).json({ message: "You cannot friend yourself" });
-  }
-
   try {
+    let targetUserId = receiver_user_id;
+
+    // QR scan and manual code entry both send contact_code.
+    // This keeps the backend path identical for both add-contact methods.
+    if (!targetUserId && contact_code) {
+      const userLookup = await pool.query(
+        `SELECT id
+         FROM users
+         WHERE contact_code = $1
+           AND COALESCE(entity_type, 'human') = 'human'
+         LIMIT 1`,
+        [contact_code]
+      );
+
+      if (userLookup.rows.length === 0) {
+        return res.status(404).json({ message: "Contact code not found" });
+      }
+
+      targetUserId = userLookup.rows[0].id;
+    }
+
+    if (!targetUserId) {
+      return res.status(400).json({
+        message: "receiver_user_id or contact_code is required",
+      });
+    }
+
+    if (Number(targetUserId) === Number(senderUserId)) {
+      return res.status(400).json({ message: "You cannot friend yourself" });
+    }
+
     const existingFriendship = await pool.query(
       `SELECT id FROM friendships
        WHERE (user_a = $1 AND user_b = $2)
           OR (user_a = $2 AND user_b = $1)`,
-      [senderUserId, receiver_user_id]
+      [senderUserId, targetUserId]
     );
 
     if (existingFriendship.rows.length > 0) {
@@ -66,7 +91,7 @@ router.post("/request", authMiddleware, async (req, res) => {
        WHERE sender_user_id = $1 AND receiver_user_id = $2
        ORDER BY created_at DESC
        LIMIT 1`,
-      [senderUserId, receiver_user_id]
+      [senderUserId, targetUserId]
     );
 
     if (
@@ -80,7 +105,30 @@ router.post("/request", authMiddleware, async (req, res) => {
       `INSERT INTO friend_requests (sender_user_id, receiver_user_id, status)
        VALUES ($1, $2, 'pending')
        RETURNING *`,
-      [senderUserId, receiver_user_id]
+      [senderUserId, targetUserId]
+    );
+
+    await pool.query(
+      `INSERT INTO notifications (
+         user_id,
+         type,
+         title,
+         body,
+         action_route,
+         metadata
+       )
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        targetUserId,
+        "friend_request",
+        "New friend request",
+        "Someone sent you a friend request.",
+        "/requests",
+        JSON.stringify({
+          request_id: result.rows[0].id,
+          sender_user_id: senderUserId,
+        }),
+      ]
     );
 
     res.json({
@@ -128,6 +176,40 @@ router.post("/request/:id/accept", authMiddleware, async (req, res) => {
        VALUES ($1, $2)`,
       [request.sender_user_id, request.receiver_user_id]
     );
+
+    await pool.query(
+      `INSERT INTO notifications (
+         user_id,
+         type,
+         title,
+         body,
+         action_route,
+         metadata
+       )
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        request.sender_user_id,
+        "friend_request_accepted",
+        "Friend request accepted",
+        "Your friend request was accepted.",
+        "/contacts",
+        JSON.stringify({
+          request_id: request.id,
+          accepted_by_user_id: userId,
+        }),
+      ]
+    );
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: null,
+        event_type: 'social.friend_added',
+        source: 'friends',
+      });
+    } catch(eventErr){
+      console.warn('[friends] event processing failed:', eventErr.message);
+    }
 
     res.json({
       success: true,
@@ -214,6 +296,14 @@ router.get("/", authMiddleware, async (req, res) => {
            ELSE u1.email
          END AS friend_email,
          CASE
+           WHEN f.user_a = $1 THEN u2.username
+           ELSE u1.username
+         END AS friend_username,
+         CASE
+           WHEN f.user_a = $1 THEN u2.full_name
+           ELSE u1.full_name
+         END AS friend_display_name,
+         CASE
            WHEN f.user_a = $1 THEN u2.contact_code
            ELSE u1.contact_code
          END AS friend_contact_code,
@@ -236,16 +326,78 @@ router.get("/", authMiddleware, async (req, res) => {
   }
 });
 
-// GET /friends/search/:contact_code
-router.get("/search/:contact_code", authMiddleware, async (req, res) => {
+// DELETE /friends/:friend_user_id
+router.delete("/:friend_user_id", authMiddleware, async (req, res) => {
   const userId = req.user.id;
-  const contactCode = req.params.contact_code;
+  const friendUserId = req.params.friend_user_id;
+
+  if (!friendUserId) {
+    return res.status(400).json({ message: "friend_user_id is required" });
+  }
+
+  if (Number(friendUserId) === Number(userId)) {
+    return res.status(400).json({ message: "You cannot remove yourself" });
+  }
 
   try {
     const result = await pool.query(
-      `SELECT id, email, contact_code
+      `DELETE FROM friendships
+       WHERE (user_a = $1 AND user_b = $2)
+          OR (user_a = $2 AND user_b = $1)
+       RETURNING *`,
+      [userId, friendUserId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Friendship not found" });
+    }
+
+    await pool.query(
+      `INSERT INTO notifications (
+         user_id,
+         type,
+         title,
+         body,
+         action_route,
+         metadata
+       )
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        friendUserId,
+        "friend_removed",
+        "Contact removed",
+        "A contact connection was removed.",
+        "/contacts",
+        JSON.stringify({
+          removed_by_user_id: userId,
+        }),
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: "Contact removed",
+      friendship: result.rows[0],
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to remove contact" });
+  }
+});
+
+// GET /friends/search/:contact_code
+router.get("/search/:contact_code", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const contactCode = req.params.contact_code?.trim()?.toUpperCase();
+
+  try {
+    const result = await pool.query(
+      `SELECT id, email, username, full_name, contact_code
        FROM users
-       WHERE contact_code = $1 AND id != $2`,
+       WHERE contact_code = $1
+         AND id != $2
+         AND COALESCE(entity_type, 'human') = 'human'
+       LIMIT 1`,
       [contactCode, userId]
     );
 
@@ -263,4 +415,5 @@ router.get("/search/:contact_code", authMiddleware, async (req, res) => {
   }
 });
 
-module.exports = router;
+module.exports = router; 
+

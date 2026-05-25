@@ -2,18 +2,16 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const QRCode = require("qrcode");
 const { OAuth2Client } = require("google-auth-library");
 const { Resend } = require("resend");
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const router = express.Router();
 const pool = require("../db");
+const { generateKBT } = require("../utils/idGenerator");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_WEB_CLIENT_ID);
-
-function generateContactCode() {
-  return "KBT-" + crypto.randomBytes(4).toString("hex").toUpperCase();
-}
 
 function signUserToken(user) {
   return jwt.sign(
@@ -23,7 +21,13 @@ function signUserToken(user) {
   );
 }
 
-function buildUserResponse(user) {
+async function buildUserResponse(user) {
+  let contactQr = null;
+
+  if (user.contact_code) {
+    contactQr = await QRCode.toDataURL(user.contact_code);
+  }
+
   return {
     id: user.id,
     email: user.email,
@@ -31,8 +35,27 @@ function buildUserResponse(user) {
     full_name: user.full_name,
     username: user.username,
     contact_code: user.contact_code,
+    contact_qr: contactQr,
+    entity_type: user.entity_type || "human",
     auth_provider: user.auth_provider || "local",
   };
+}
+
+async function ensureUserIdentity(user) {
+  if (user.contact_code && user.entity_type) return user;
+
+  const contactCode = user.contact_code || (await generateKBT());
+
+  const result = await pool.query(
+    `UPDATE users
+     SET contact_code = COALESCE(contact_code, $1),
+         entity_type = COALESCE(entity_type, 'human')
+     WHERE id = $2
+     RETURNING *`,
+    [contactCode, user.id]
+  );
+
+  return result.rows[0];
 }
 
 router.post("/register", async (req, res) => {
@@ -69,12 +92,12 @@ router.post("/register", async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const contactCode = generateContactCode();
+    const contactCode = await generateKBT();
 
     const result = await pool.query(
-      `INSERT INTO users (email, password, contact_code, full_name, username, auth_provider)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, email, contact_code, full_name, username, auth_provider`,
+      `INSERT INTO users (email, password, contact_code, entity_type, full_name, username, auth_provider)
+       VALUES ($1, $2, $3, 'human', $4, $5, $6)
+       RETURNING id, email, contact_code, entity_type, full_name, username, auth_provider`,
       [
         normalizedEmail,
         hashedPassword,
@@ -85,13 +108,13 @@ router.post("/register", async (req, res) => {
       ]
     );
 
-    const user = result.rows[0];
+    let user = result.rows[0];
     const token = signUserToken(user);
 
     res.json({
       message: "User registered",
       token,
-      user: buildUserResponse(user),
+      user: await buildUserResponse(user),
     });
   } catch (error) {
     console.error("Register error:", error);
@@ -130,12 +153,14 @@ router.post("/login", async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
+    user = await ensureUserIdentity(user);
+
     const token = signUserToken(user);
 
     res.json({
       message: "Login successful",
       token,
-      user: buildUserResponse(user),
+      user: await buildUserResponse(user),
     });
   } catch (error) {
     console.error("Login error:", error);
@@ -184,7 +209,7 @@ router.post("/google", async (req, res) => {
     let user;
 
     if (userResult.rows.length === 0) {
-      const contactCode = generateContactCode();
+      const contactCode = await generateKBT();
 
       let baseUsername =
         (email.split("@")[0] || "user")
@@ -207,9 +232,9 @@ router.post("/google", async (req, res) => {
       }
 
       const insertResult = await pool.query(
-        `INSERT INTO users (email, password, contact_code, full_name, username, auth_provider, google_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, email, contact_code, full_name, username, auth_provider, google_id`,
+        `INSERT INTO users (email, password, contact_code, entity_type, full_name, username, auth_provider, google_id)
+         VALUES ($1, $2, $3, 'human', $4, $5, $6, $7)
+         RETURNING id, email, contact_code, entity_type, full_name, username, auth_provider, google_id`,
         [email, null, contactCode, fullName, username, "google", googleId]
       );
 
@@ -221,24 +246,28 @@ router.post("/google", async (req, res) => {
         `UPDATE users
          SET google_id = COALESCE(google_id, $1),
              full_name = COALESCE(full_name, $2),
+             contact_code = COALESCE(contact_code, $3),
+             entity_type = COALESCE(entity_type, 'human'),
              auth_provider = CASE
                WHEN auth_provider = 'local' THEN 'google'
                ELSE auth_provider
              END
-         WHERE id = $3
-         RETURNING id, email, contact_code, full_name, username, auth_provider, google_id, password`,
-        [googleId, fullName, user.id]
+         WHERE id = $4
+         RETURNING id, email, contact_code, entity_type, full_name, username, auth_provider, google_id, password`,
+        [googleId, fullName, user.contact_code || (await generateKBT()), user.id]
       );
 
       user = updatedResult.rows[0];
     }
+
+    user = await ensureUserIdentity(user);
 
     const token = signUserToken(user);
 
     res.json({
       message: "Google login successful",
       token,
-      user: buildUserResponse(user),
+      user: await buildUserResponse(user),
     });
   } catch (error) {
     console.error("Google auth error:", error);

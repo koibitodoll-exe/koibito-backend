@@ -4,6 +4,7 @@ const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 const notify = require("../utils/notify");
 const jwt = require("jsonwebtoken");
+const { processEvent } = require("../services/eventProcessor");
 
 let reminderColumnsCache = null;
 
@@ -195,6 +196,17 @@ router.post("/", authMiddleware, async (req, res) => {
       );
     }
 
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: koibito_id || null,
+        event_type: 'reminder.created',
+        source: 'reminder',
+      });
+    } catch(eventErr){
+      console.warn('[reminder] event processing failed:', eventErr.message);
+    }
+
     res.json({
       success: true,
       message: "Reminder created",
@@ -289,6 +301,11 @@ router.post("/device-create", async (req, res) => {
     if (columns.has("notes")) {
       insertColumns.push("notes");
       values.push(notes);
+    }
+
+    if (columns.has("bell_enabled")) {
+      insertColumns.push("bell_enabled");
+      values.push(true);
     }
 
     if (columns.has("created_by_name")) {

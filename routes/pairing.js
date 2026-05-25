@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
 const pool = require("../db");
+const { processEvent } = require("../services/eventProcessor");
 
 // POST /pairing/start
 router.post("/start", authMiddleware, async (req, res) => {
@@ -46,7 +47,13 @@ router.get("/:session_id/devices", authMiddleware, async (req, res) => {
     }
 
     const devices = await pool.query(
-      `SELECT device_id, online_status, last_seen
+      `SELECT device_id,
+              online_status,
+              last_seen,
+              device_type,
+              runtime,
+              capabilities,
+              firmware_version
        FROM devices
        WHERE online_status = 'online'
        ORDER BY last_seen DESC`
@@ -54,14 +61,25 @@ router.get("/:session_id/devices", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
-      devices: devices.rows.map((d, index) => ({
-        device_id: d.device_id,
-        name: `Koibito ${index + 1}`,
-        claimed: false,
-        pairing_mode: true,
-        online_status: d.online_status,
-        last_seen: d.last_seen,
-      })),
+      devices: devices.rows.map((d, index) => {
+        const deviceType = d.device_type || "pi";
+        const runtime = d.runtime || (deviceType === "esp" ? "esp32" : "raspberry_pi");
+
+        return {
+          device_id: d.device_id,
+          name: `Koibito ${index + 1}`,
+          claimed: false,
+          pairing_mode: true,
+          online_status: d.online_status,
+          last_seen: d.last_seen,
+
+          // ESP/Pi runtime metadata
+          device_type: deviceType,
+          runtime,
+          capabilities: Array.isArray(d.capabilities) ? d.capabilities : [],
+          firmware_version: d.firmware_version || null,
+        };
+      }),
     });
   } catch (err) {
     console.error(err);
@@ -106,6 +124,20 @@ router.post("/:session_id/claim", authMiddleware, async (req, res) => {
     if (deviceCheck.rows.length === 0) {
       return res.status(404).json({ message: "device not found" });
     }
+
+    const device = deviceCheck.rows[0];
+
+    const device_type =
+      device.device_type || "pi";
+
+    const runtime =
+      device.runtime ||
+      (device_type === "esp" ? "esp32" : "raspberry_pi");
+
+    const capabilities =
+      Array.isArray(device.capabilities)
+      ? device.capabilities
+      : [];
 
     await client.query("BEGIN");
 
@@ -185,6 +217,23 @@ await client.query(`
     );
 
     await client.query("COMMIT");
+
+    // Badge/event bridge: pairing succeeded, so emit the normal Event Language event.
+    // This runs after COMMIT so badge failures never roll back a successful pairing.
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: koibito.id,
+        event_type: "koibito.paired",
+        source: "pairing_claim",
+        metadata: {
+          device_id,
+          pairing_session_id: session_id,
+        },
+      });
+    } catch (eventErr) {
+      console.error("[pairing] failed to process koibito.paired event", eventErr);
+    }
 
     res.json({
       success: true,

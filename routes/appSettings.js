@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { processEvent } = require("../services/eventProcessor");
 
 // GET /app-settings
 router.get("/", authMiddleware, async (req, res) => {
@@ -49,6 +50,17 @@ router.patch("/preferences", authMiddleware, async (req, res) => {
        RETURNING *`,
       [userId, dark_mode, notifications_enabled]
     );
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: null,
+        event_type: 'settings.theme_changed',
+        source: 'app_settings',
+      });
+    } catch(eventErr){
+      console.warn('[settings] event processing failed:', eventErr.message);
+    }
 
     res.json({
       success: true,

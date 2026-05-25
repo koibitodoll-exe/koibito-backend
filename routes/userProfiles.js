@@ -5,6 +5,8 @@ const authMiddleware = require("../middleware/authMiddleware");
 const multer = require("multer");
 const path = require("path");
 const supabase = require("../lib/supabase");
+const QRCode = require("qrcode");
+const { processEvent } = require("../services/eventProcessor");
 
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -125,24 +127,42 @@ router.get("/profile", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
-         id,
-         user_id,
-         display_name,
-         avatar,
-         bio,
-         gender,
-         birthday,
+         up.id,
+         up.user_id,
+         up.display_name,
+         up.avatar,
+         up.bio,
+         up.gender,
+         up.birthday,
+         u.contact_code,
          COALESCE(profile_visibility, 'public') AS profile_visibility,
-         created_at,
-         updated_at
-       FROM user_profiles
-       WHERE user_id = $1`,
+         up.created_at,
+         up.updated_at
+       FROM user_profiles up
+       LEFT JOIN users u
+       ON u.id = up.user_id
+       WHERE up.user_id = $1`,
       [userId]
     );
 
+    const profile = result.rows[0] || null;
+
+    let contact_qr = null;
+
+    if (profile?.contact_code) {
+      contact_qr = await QRCode.toDataURL(
+        profile.contact_code
+      );
+    }
+
     res.json({
       success: true,
-      profile: result.rows[0] || null,
+      profile: profile
+      ? {
+          ...profile,
+          contact_qr,
+        }
+      : null,
     });
   } catch (err) {
     console.error(err);
@@ -437,6 +457,17 @@ router.patch("/persona", authMiddleware, async (req, res) => {
     );
 
     await queueOwnerProfileSync(userId);
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: null,
+        event_type: 'user.persona_edited',
+        source: 'persona',
+      });
+    } catch(eventErr){
+      console.warn('[persona] event processing failed:', eventErr.message);
+    }
 
     res.json({
       success: true,

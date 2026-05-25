@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
 const notify = require("../utils/notify");
+const { processEvent } = require("../services/eventProcessor");
 
 const MAX_KOIBITO_COMMENTS_PER_ENTRY = 5;
 
@@ -203,6 +204,19 @@ router.post("/user", authMiddleware, async (req, res) => {
       [userId, entry_text, date]
     );
 
+    try {
+      const primaryKoibito = await getPrimaryKoibitoForUser(userId);
+
+      await processEvent({
+        user_id: userId,
+        koibito_id: primaryKoibito?.id || null,
+        event_type: 'diary.entry_created',
+        source: 'diary',
+      });
+    } catch(eventErr){
+      console.warn('[diary] event processing failed:', eventErr.message);
+    }
+
     res.json({
       success: true,
       message: "User diary entry created",
@@ -211,6 +225,68 @@ router.post("/user", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to create user diary entry" });
+  }
+});
+
+
+// PATCH /diary/user/:entry_id
+router.patch("/user/:entry_id", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const entryId = req.params.entry_id;
+  const { entry_text, date } = req.body;
+
+  if (!entry_text || !date) {
+    return res.status(400).json({ message: "entry_text and date are required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE user_diary_entries
+       SET entry_text = $1, date = $2
+       WHERE id = $3 AND user_id = $4
+       RETURNING *`,
+      [entry_text, date, entryId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "User diary entry not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "User diary entry updated",
+      entry: result.rows[0],
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to update user diary entry" });
+  }
+});
+
+// DELETE /diary/user/:entry_id
+router.delete("/user/:entry_id", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const entryId = req.params.entry_id;
+
+  try {
+    const result = await pool.query(
+      `DELETE FROM user_diary_entries
+       WHERE id = $1 AND user_id = $2
+       RETURNING id`,
+      [entryId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "User diary entry not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "User diary entry deleted",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to delete user diary entry" });
   }
 });
 
@@ -433,6 +509,35 @@ router.post("/koibito/:entry_id/comment", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to create koibito diary comment" });
+  }
+});
+
+
+// DELETE /diary/koibito/comments/user
+router.delete("/koibito/comments/user", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const deleteResult = await pool.query(
+      `DELETE FROM koibito_diary_comments
+       WHERE diary_id IN (
+         SELECT id
+         FROM koibito_diary_entries
+         WHERE user_id = $1
+       )
+       AND (koibito_id IS NULL OR koibito_id = 0 OR LOWER(COALESCE(koibito_name, '')) = 'you')
+       RETURNING id`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      message: "User diary comments deleted",
+      deleted_count: deleteResult.rowCount || 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to delete user diary comments" });
   }
 });
 

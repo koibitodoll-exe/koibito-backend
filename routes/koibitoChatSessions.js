@@ -2,6 +2,54 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { generateReply } = require("../services/cloudBrain");
+const { emitSessionUpdate } = require("../services/liveSync");
+
+async function processChatEvent(event) {
+  try {
+    await pool.query(
+      `INSERT INTO interaction_events (user_id, koibito_id, event_type, source, payload, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [
+        event.userId || null,
+        event.koibitoId || null,
+        event.eventType || 'chat.message.created',
+        event.source || event.channel || 'chat',
+        JSON.stringify({
+          channel: event.channel,
+          message: event.message,
+          sender_type: event.senderType,
+          room_id: event.roomId,
+          group_id: event.groupId,
+          session_id: event.sessionId,
+          metadata: event.metadata || {},
+        }),
+      ]
+    );
+  } catch (error) {
+    console.log('interaction_events insert skipped:', error.message);
+  }
+
+  if (event.skipReply || !event.koibitoId || !event.userId || !event.message) {
+    return { replyText: null };
+  }
+
+  try {
+    const brainResult = await generateReply({
+      koibitoId: event.koibitoId,
+      userId: event.userId,
+      userMessage: event.message,
+    });
+
+    return {
+      replyText: brainResult?.reply || null,
+      packet: brainResult?.packet || null,
+    };
+  } catch (error) {
+    console.log('Cloud Brain generateReply skipped:', error.message);
+    return { replyText: null };
+  }
+}
 
 // POST /koibito-chat/request
 router.post("/request", authMiddleware, async (req, res) => {
@@ -108,10 +156,16 @@ router.post("/request/:id/approve", authMiddleware, async (req, res) => {
       ]
     );
 
+    const session = sessionResult.rows[0];
+
+    if (typeof emitSessionUpdate === 'function') {
+      emitSessionUpdate(session.id, 'session_created', { session });
+    }
+
     res.json({
       success: true,
       message: "Chat request approved",
-      session: sessionResult.rows[0],
+      session,
     });
   } catch (err) {
     console.error(err);
@@ -237,10 +291,57 @@ router.post("/sessions/:id/message", authMiddleware, async (req, res) => {
       [sessionId, userId, message_text || null, media_url]
     );
 
+    const sessionMessage = result.rows[0];
+    const session = sessionCheck.rows[0];
+
+    if (message_text && String(message_text).trim()) {
+      let cloudReplyText = null;
+
+      try {
+        const brainResult = await processChatEvent({
+          source: 'active_session',
+          channel: 'active_session',
+          eventType: 'chat.session.friend_message.created',
+          userId,
+          koibitoId: session.koibito_id,
+          sessionId,
+          message: String(message_text).trim(),
+          senderType: 'user',
+          metadata: {
+            session_message: sessionMessage,
+            requester_user_id: session.requester_user_id,
+            owner_user_id: session.owner_user_id,
+          },
+        });
+
+        cloudReplyText = brainResult.replyText;
+      } catch (error) {
+        console.log('Cloud Brain session reply skipped:', error.message);
+      }
+
+      if (cloudReplyText && String(cloudReplyText).trim()) {
+        const replyResult = await pool.query(
+          `INSERT INTO active_chat_messages
+           (session_id, sender_type, sender_id, message_text, media_url)
+           VALUES ($1, 'koibito', $2, $3, NULL)
+           RETURNING *`,
+          [sessionId, session.koibito_id, String(cloudReplyText).trim()]
+        );
+
+        if (typeof emitSessionUpdate === 'function') {
+          emitSessionUpdate(sessionId, 'message_created', { message: replyResult.rows[0] });
+        }
+      }
+    }
+
+    if (typeof emitSessionUpdate === 'function') {
+      emitSessionUpdate(sessionId, 'message_created', { message: sessionMessage });
+    }
+
     res.json({
       success: true,
       message: "Session message sent",
-      session_message: result.rows[0],
+      session_message: sessionMessage,
     });
   } catch (err) {
     console.error(err);

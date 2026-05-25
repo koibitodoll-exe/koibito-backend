@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { processEvent } = require("../services/eventProcessor");
 
 // GET /games
 router.get("/", authMiddleware, async (req, res) => {
@@ -230,6 +231,17 @@ router.post("/lobbies/:id/start", authMiddleware, async (req, res) => {
        RETURNING *`,
       [lobbyId]
     );
+
+    try {
+      await processEvent({
+        user_id: userId,
+        koibito_id: null,
+        event_type: 'activity.game_completed',
+        source: 'games',
+      });
+    } catch(eventErr){
+      console.warn('[games] event processing failed:', eventErr.message);
+    }
 
     res.json({
       success: true,

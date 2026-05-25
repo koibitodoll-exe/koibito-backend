@@ -2,6 +2,8 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { generateKOI } = require("../utils/idGenerator");
+const { syncSoulPacket } = require("../services/soulPacketSync");
 
 async function ensureKoibitoOwnership(koibitoId, userId) {
   const result = await pool.query(
@@ -9,110 +11,6 @@ async function ensureKoibitoOwnership(koibitoId, userId) {
     [koibitoId, userId]
   );
   return result.rows[0] || null;
-}
-
-async function queueConfigPatchForKoibito(koibitoId) {
-  const koibitoResult = await pool.query(
-    `SELECT
-       k.id,
-       k.name,
-       k.avatar,
-       k.gender,
-       COALESCE(k.is_primary, false) AS is_primary
-     FROM koibitos k
-     WHERE k.id = $1`,
-    [koibitoId]
-  );
-
-  if (koibitoResult.rows.length === 0) return;
-
-  const koibito = koibitoResult.rows[0];
-
-  const aliasesResult = await pool.query(
-    `SELECT aliases
-     FROM koibito_aliases
-     WHERE koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const rulesResult = await pool.query(
-    `SELECT must_rules, never_rules, character_rule
-     FROM koibito_rules
-     WHERE koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const traitsResult = await pool.query(
-    `SELECT td.label
-     FROM koibito_traits kt
-     JOIN trait_definitions td ON td.id = kt.trait_id
-     WHERE kt.koibito_id = $1
-     ORDER BY td.label ASC`,
-    [koibitoId]
-  );
-
-  const voiceResult = await pool.query(
-    `SELECT
-       vp.id,
-       vp.voice_key,
-       vp.label,
-       vp.provider
-     FROM koibito_voice_settings kvs
-     JOIN voice_profiles vp ON vp.id = kvs.voice_profile_id
-     WHERE kvs.koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const settingsResult = await pool.query(
-    `SELECT profanity_mode
-     FROM koibito_settings
-     WHERE koibito_id = $1`,
-    [koibitoId]
-  );
-
-  const aliases = aliasesResult.rows[0]?.aliases || [];
-  const rules = rulesResult.rows[0] || {
-    must_rules: [],
-    never_rules: [],
-    character_rule: "",
-  };
-  const traits = traitsResult.rows.map((row) => row.label);
-  const voice = voiceResult.rows[0] || null;
-  const profanity_mode = settingsResult.rows[0]?.profanity_mode ?? false;
-
-  const payload = {
-    koibito_id: koibito.id,
-    patch: {
-      doll_profile: {
-        name: koibito.name,
-        avatar: koibito.avatar,
-        gender: koibito.gender,
-        is_primary: koibito.is_primary,
-        aliases,
-        traits,
-        must_rules: rules.must_rules || [],
-        never_rules: rules.never_rules || [],
-        character_rule: rules.character_rule || "",
-        profanity_allowed: profanity_mode,
-        voice: voice
-          ? {
-              id: voice.id,
-              voice_key: voice.voice_key,
-              label: voice.label,
-              provider: voice.provider,
-            }
-          : null,
-      },
-    },
-  };
-
-  await pool.query(
-    `INSERT INTO device_commands (device_id, command_type, payload)
-     SELECT d.device_id, 'config_patch', $2
-     FROM devices d
-     WHERE d.koibito_id = $1`,
-    [koibitoId, JSON.stringify(payload)]
-  );
 }
 
 // GET /koibitos
@@ -127,6 +25,7 @@ router.get("/", authMiddleware, async (req, res) => {
          k.name,
          k.avatar,
          k.gender,
+         k.koibito_code,
          COALESCE(k.is_primary, false) AS is_primary,
          COALESCE(d.online_status, k.status, 'offline') AS status,
          COALESCE(k.battery_percent, 0) AS battery_percent,
@@ -163,6 +62,7 @@ router.get("/:id/profile", authMiddleware, async (req, res) => {
          k.name,
          k.avatar,
          k.gender,
+         k.koibito_code,
          COALESCE(k.is_primary, false) AS is_primary,
          COALESCE(d.online_status, k.status, 'offline') AS status,
          COALESCE(k.battery_percent, 0) AS battery_percent,
@@ -364,6 +264,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
          k.name,
          k.avatar,
          k.gender,
+         k.koibito_code,
          COALESCE(k.is_primary, false) AS is_primary,
          COALESCE(d.online_status, k.status, 'offline') AS status,
          COALESCE(k.battery_percent, 0) AS battery_percent,
@@ -419,6 +320,23 @@ router.post("/pair", authMiddleware, async (req, res) => {
       );
     }
 
+    let koibitoCode = await generateKOI();
+
+    if (device_id) {
+      const existingDevice = await client.query(
+        `SELECT k.koibito_code
+         FROM devices d
+         JOIN koibitos k ON k.id = d.koibito_id
+         WHERE d.device_id = $1
+         LIMIT 1`,
+        [device_id]
+      );
+
+      if (existingDevice.rows.length > 0) {
+        koibitoCode = existingDevice.rows[0].koibito_code;
+      }
+    }
+
     const koibitoResult = await client.query(
       `INSERT INTO koibitos (
          user_id,
@@ -426,13 +344,15 @@ router.post("/pair", authMiddleware, async (req, res) => {
          avatar,
          gender,
          is_primary,
+         koibito_code,
+         entity_type,
          paired_at,
          created_at,
          updated_at
        )
-       VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, 'koibito', NOW(), NOW(), NOW())
        RETURNING *`,
-      [userId, name, avatar || null, gender, Boolean(is_primary)]
+      [userId, name, avatar || null, gender, Boolean(is_primary), koibitoCode]
     );
 
     const koibito = koibitoResult.rows[0];
@@ -448,11 +368,11 @@ router.post("/pair", authMiddleware, async (req, res) => {
 
     await client.query("COMMIT");
 
-    await queueConfigPatchForKoibito(koibito.id);
+    await syncSoulPacket(koibito.id, userId);
 
     res.json({
       success: true,
-      message: "Koibito paired successfully",
+      message: "Koibito paired and Soul Packet synced",
       koibito,
     });
   } catch (err) {
@@ -517,11 +437,11 @@ router.patch("/:id", authMiddleware, async (req, res) => {
 
     await client.query("COMMIT");
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
     res.json({
       success: true,
-      message: "Koibito updated",
+      message: "Koibito updated and Soul Packet synced",
       koibito: result.rows[0],
     });
   } catch (err) {
@@ -570,11 +490,11 @@ router.patch("/:id/primary", authMiddleware, async (req, res) => {
 
     await client.query("COMMIT");
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
     res.json({
       success: true,
-      message: "Primary Koibito updated",
+      message: "Primary Koibito updated and Soul Packet synced and Soul Packet synced",
       koibito: result.rows[0],
     });
   } catch (err) {
@@ -659,9 +579,9 @@ router.put("/:id/rules", authMiddleware, async (req, res) => {
       [koibitoId, JSON.stringify(must_rules), JSON.stringify(never_rules), character_rule]
     );
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
-    res.json({ success: true, message: "Rules updated and config patch queued" });
+    res.json({ success: true, message: "Rules updated and Soul Packet synced" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to update rules" });
@@ -691,11 +611,11 @@ router.put("/:id/character-rule", authMiddleware, async (req, res) => {
       [koibitoId, character_rule]
     );
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
     res.json({
       success: true,
-      message: "Character rule updated and config patch queued",
+      message: "Character rule updated and Soul Packet synced",
       character_rule,
     });
   } catch (err) {
@@ -727,9 +647,9 @@ router.put("/:id/aliases", authMiddleware, async (req, res) => {
       [koibitoId, JSON.stringify(aliases)]
     );
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
-    res.json({ success: true, message: "Aliases updated and config patch queued" });
+    res.json({ success: true, message: "Aliases updated and Soul Packet synced" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to update aliases" });
@@ -770,9 +690,9 @@ router.put("/:id/voice", authMiddleware, async (req, res) => {
       [koibitoId, voice_profile_id]
     );
 
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
-    res.json({ success: true, message: "Voice updated and config patch queued" });
+    res.json({ success: true, message: "Voice updated and Soul Packet synced" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Failed to update voice" });
@@ -830,9 +750,11 @@ router.post("/:id/badges", authMiddleware, async (req, res) => {
       [koibitoId]
     );
 
+    await syncSoulPacket(koibitoId, userId);
+
     res.json({
       success: true,
-      message: "Badge assigned",
+      message: "Badge assigned and Soul Packet synced",
       badges: result.rows,
     });
   } catch (err) {
@@ -943,19 +865,11 @@ router.put("/:id/settings/features", authMiddleware, async (req, res) => {
       ]
     );
 
-    await pool.query(
-      `INSERT INTO device_commands (device_id, command_type, payload)
-       SELECT d.device_id, 'config_patch', $2
-       FROM devices d
-       WHERE d.koibito_id = $1`,
-      [koibitoId, JSON.stringify(result.rows[0])]
-    );
-
-    await queueConfigPatchForKoibito(koibitoId);
+    await syncSoulPacket(koibitoId, userId);
 
     res.json({
       success: true,
-      message: "Koibito feature settings updated and sync queued",
+      message: "Koibito feature settings updated and Soul Packet synced",
       settings: result.rows[0],
     });
   } catch (err) {
@@ -1172,4 +1086,4 @@ router.post("/:id/settings/hard-reset", authMiddleware, async (req, res) => {
   }
 });
 
-module.exports = router;
+module.exports = router; 

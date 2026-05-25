@@ -3,6 +3,54 @@ const router = express.Router();
 const crypto = require("crypto");
 const pool = require("../db");
 const authMiddleware = require("../middleware/authMiddleware");
+const { generateReply } = require("../services/cloudBrain");
+const { emitKoibitoChatUpdate } = require("../services/liveSync");
+
+async function processChatEvent(event) {
+  try {
+    await pool.query(
+      `INSERT INTO interaction_events (user_id, koibito_id, event_type, source, payload, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [
+        event.userId || null,
+        event.koibitoId || null,
+        event.eventType || 'chat.message.created',
+        event.source || event.channel || 'chat',
+        JSON.stringify({
+          channel: event.channel,
+          message: event.message,
+          sender_type: event.senderType,
+          room_id: event.roomId,
+          group_id: event.groupId,
+          session_id: event.sessionId,
+          metadata: event.metadata || {},
+        }),
+      ]
+    );
+  } catch (error) {
+    console.log('interaction_events insert skipped:', error.message);
+  }
+
+  if (event.skipReply || !event.koibitoId || !event.userId || !event.message) {
+    return { replyText: null };
+  }
+
+  try {
+    const brainResult = await generateReply({
+      koibitoId: event.koibitoId,
+      userId: event.userId,
+      userMessage: event.message,
+    });
+
+    return {
+      replyText: brainResult?.reply || null,
+      packet: brainResult?.packet || null,
+    };
+  } catch (error) {
+    console.log('Cloud Brain generateReply skipped:', error.message);
+    return { replyText: null };
+  }
+}
 
 // helper
 function toTimeString(date) {
@@ -201,6 +249,57 @@ router.post("/koibito/:id/messages", authMiddleware, async (req, res) => {
 
     await client.query("COMMIT");
 
+    let cloudReplyText = null;
+
+    if (sender === "me" && !isAction) {
+      try {
+        const brainResult = await processChatEvent({
+          source: 'koibito_chat',
+          channel: 'koibito_chat',
+          eventType: 'chat.koibito.user_message.created',
+          userId,
+          koibitoId,
+          message: text.trim(),
+          senderType: 'user',
+          metadata: {
+            message_id: messageId,
+            is_action: !!isAction,
+          },
+        });
+
+        cloudReplyText = brainResult.replyText;
+      } catch (error) {
+        console.log('Cloud Brain koibito reply skipped:', error.message);
+      }
+    } else {
+      await processChatEvent({
+        source: 'koibito_chat',
+        channel: 'koibito_chat',
+        eventType: isAction ? 'chat.koibito.action.created' : 'chat.koibito.message.created',
+        userId,
+        koibitoId,
+        message: text.trim(),
+        senderType: sender,
+        skipReply: true,
+        metadata: {
+          message_id: messageId,
+          is_action: !!isAction,
+        },
+      });
+    }
+
+    if (cloudReplyText && String(cloudReplyText).trim()) {
+      await pool.query(
+        `
+        INSERT INTO koibito_messages (
+          id, koibito_id, user_id, sender, text, is_action, created_at
+        )
+        VALUES ($1, $2, $3, 'them', $4, FALSE, NOW())
+        `,
+        [crypto.randomUUID(), koibitoId, userId, String(cloudReplyText).trim()]
+      );
+    }
+
     // return fresh thread
     const messagesResult = await pool.query(
       `
@@ -237,14 +336,23 @@ router.post("/koibito/:id/messages", authMiddleware, async (req, res) => {
       threshold: 50,
     };
 
+    const streakPayload = {
+      daysLit: streakRow.days_lit || 0,
+      streakCount: streakRow.streak_count || 0,
+      todayCount: streakRow.today_count || 0,
+      threshold: streakRow.threshold || 50,
+    };
+
+    if (typeof emitKoibitoChatUpdate === 'function') {
+      emitKoibitoChatUpdate(koibitoId, userId, 'message_created', {
+        messages,
+        streak: streakPayload,
+      });
+    }
+
     res.json({
       messages,
-      streak: {
-        daysLit: streakRow.days_lit || 0,
-        streakCount: streakRow.streak_count || 0,
-        todayCount: streakRow.today_count || 0,
-        threshold: streakRow.threshold || 50,
-      },
+      streak: streakPayload,
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -278,6 +386,13 @@ router.delete("/koibito/:id/messages", authMiddleware, async (req, res) => {
       `,
       [koibitoId, userId]
     );
+
+    if (typeof emitKoibitoChatUpdate === 'function') {
+      emitKoibitoChatUpdate(koibitoId, userId, 'messages_cleared', {
+        koibito_id: koibitoId,
+        user_id: userId,
+      });
+    }
 
     res.json({ success: true });
   } catch (error) {
