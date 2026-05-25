@@ -23,6 +23,7 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
     "nodemon": "^3.1.14",
+    "openai": "^6.39.0",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",
     "resend": "^6.12.2",
